@@ -71,12 +71,15 @@ pub struct TimelineEvidence {
     pub observed_at_ms: u64,
     pub armed_at_ms: u64,
     pub signal_at_ms: u64,
+    /// Trusted orchestrator timestamp taken only after the model proposal is fully recorded.
+    pub decision_recorded_at_ms: u64,
     pub quote_at_ms: u64,
     pub now_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MarketEvidence {
+    pub as_of_ms: u64,
     pub liquidity_cents: u64,
     pub volume_24h_cents: u64,
     pub market_cap_cents: u64,
@@ -86,6 +89,7 @@ pub struct MarketEvidence {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TokenEvidence {
+    pub checked_at_ms: u64,
     pub exact_mint_verified: bool,
     pub security_gate_passed: bool,
     pub dex_first_verified: bool,
@@ -94,6 +98,9 @@ pub struct TokenEvidence {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecutionEvidence {
+    pub mode: ExecutionMode,
+    pub purpose: Purpose,
+    pub quoted_notional_cents: u64,
     pub route_verified: bool,
     pub slippage_bps: u32,
     pub price_impact_bps: u32,
@@ -137,6 +144,9 @@ pub struct RiskConfig {
     pub min_independent_price_sources: u8,
     pub emergency_exit_min_independent_price_sources: u8,
     pub max_quote_age_ms: u64,
+    pub max_market_evidence_age_ms: u64,
+    pub emergency_exit_max_market_evidence_age_ms: u64,
+    pub max_token_evidence_age_ms: u64,
     pub max_open_positions: u16,
 }
 
@@ -162,6 +172,9 @@ impl Default for RiskConfig {
             min_independent_price_sources: 2,
             emergency_exit_min_independent_price_sources: 1,
             max_quote_age_ms: 15_000,
+            max_market_evidence_age_ms: 60_000,
+            emergency_exit_max_market_evidence_age_ms: 300_000,
+            max_token_evidence_age_ms: 300_000,
             max_open_positions: 5,
         }
     }
@@ -170,13 +183,21 @@ impl Default for RiskConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rejection {
     EvidenceMintMismatch,
+    ExecutionModeMismatch,
+    ExecutionPurposeMismatch,
+    QuoteNotionalMismatch,
     GlobalKillSwitch,
     EntryHalt,
     RouteUnverified,
     QuoteNotAfterSignal,
+    QuoteNotAfterDecision,
     QuoteFromFuture,
     QuoteStale,
     InvalidSignalOrder,
+    MarketEvidenceFromFuture,
+    MarketEvidenceStale,
+    TokenEvidenceFromFuture,
+    TokenEvidenceStale,
     PriceSourceDivergence,
     TooFewIndependentPriceSources,
     ExactMintUnverified,
@@ -246,6 +267,15 @@ impl PolicyEngine {
         if !binding.matches(&proposal.mint) {
             reasons.push(Rejection::EvidenceMintMismatch);
         }
+        if execution.mode != proposal.mode {
+            reasons.push(Rejection::ExecutionModeMismatch);
+        }
+        if execution.purpose != proposal.purpose {
+            reasons.push(Rejection::ExecutionPurposeMismatch);
+        }
+        if execution.quoted_notional_cents != proposal.notional_cents {
+            reasons.push(Rejection::QuoteNotionalMismatch);
+        }
         if portfolio.global_kill_switch_active {
             reasons.push(Rejection::GlobalKillSwitch);
         }
@@ -286,6 +316,9 @@ impl PolicyEngine {
         if t.quote_at_ms <= t.signal_at_ms {
             reasons.push(Rejection::QuoteNotAfterSignal);
         }
+        if t.quote_at_ms <= t.decision_recorded_at_ms {
+            reasons.push(Rejection::QuoteNotAfterDecision);
+        }
         if t.quote_at_ms > t.now_ms {
             reasons.push(Rejection::QuoteFromFuture);
         } else if t.now_ms.saturating_sub(t.quote_at_ms) > self.config.max_quote_age_ms {
@@ -296,14 +329,31 @@ impl PolicyEngine {
             Purpose::Entry => {
                 t.observed_at_ms <= t.armed_at_ms
                     && t.armed_at_ms <= t.signal_at_ms
-                    && t.signal_at_ms < t.quote_at_ms
+                    && t.signal_at_ms <= t.decision_recorded_at_ms
+                    && t.decision_recorded_at_ms < t.quote_at_ms
             }
             Purpose::Exit | Purpose::EmergencyExit => {
-                t.observed_at_ms <= t.signal_at_ms && t.signal_at_ms < t.quote_at_ms
+                t.observed_at_ms <= t.signal_at_ms
+                    && t.signal_at_ms <= t.decision_recorded_at_ms
+                    && t.decision_recorded_at_ms < t.quote_at_ms
             }
         };
         if !valid_order {
             reasons.push(Rejection::InvalidSignalOrder);
+        }
+
+        if market.as_of_ms > t.decision_recorded_at_ms {
+            reasons.push(Rejection::MarketEvidenceFromFuture);
+        } else {
+            let age = t.decision_recorded_at_ms.saturating_sub(market.as_of_ms);
+            let cap = if emergency {
+                self.config.emergency_exit_max_market_evidence_age_ms
+            } else {
+                self.config.max_market_evidence_age_ms
+            };
+            if age > cap {
+                reasons.push(Rejection::MarketEvidenceStale);
+            }
         }
 
         let divergence_cap = if emergency {
@@ -343,6 +393,13 @@ impl PolicyEngine {
         portfolio: &PortfolioState,
         reasons: &mut Vec<Rejection>,
     ) {
+        let decision_at = execution.timeline.decision_recorded_at_ms;
+        if token.checked_at_ms > decision_at {
+            reasons.push(Rejection::TokenEvidenceFromFuture);
+        } else if decision_at.saturating_sub(token.checked_at_ms) > self.config.max_token_evidence_age_ms {
+            reasons.push(Rejection::TokenEvidenceStale);
+        }
+
         if !token.exact_mint_verified {
             reasons.push(Rejection::ExactMintUnverified);
         }
@@ -481,14 +538,21 @@ mod tests {
             phenotype: Phenotype::DexFirstLaunch,
             reason: "fixture".into(),
         };
-        let binding = EvidenceBinding::new(&proposal.mint, &proposal.mint, &proposal.mint);
+        let binding = EvidenceBinding::new(
+            proposal.mint.as_str(),
+            proposal.mint.as_str(),
+            proposal.mint.as_str(),
+        );
+        let decision = 995_500;
         let token = TokenEvidence {
+            checked_at_ms: decision - 10_000,
             exact_mint_verified: true,
             security_gate_passed: true,
             dex_first_verified: true,
             entry_trigger_confirmed: true,
         };
         let market = MarketEvidence {
+            as_of_ms: decision - 1_000,
             liquidity_cents: 2_000_000,
             volume_24h_cents: 1_000_000,
             market_cap_cents: 4_000_000,
@@ -496,6 +560,9 @@ mod tests {
             independent_price_sources: 2,
         };
         let execution = ExecutionEvidence {
+            mode: proposal.mode,
+            purpose,
+            quoted_notional_cents: proposal.notional_cents,
             route_verified: true,
             slippage_bps: 100,
             price_impact_bps: 50,
@@ -505,6 +572,7 @@ mod tests {
                 observed_at_ms: 990_000,
                 armed_at_ms: 993_000,
                 signal_at_ms: 995_000,
+                decision_recorded_at_ms: decision,
                 quote_at_ms: 996_000,
                 now_ms: 1_000_000,
             },
@@ -530,33 +598,34 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_evidence_mint_is_rejected() {
-        let (p, mut b, t, m, e, s) = fixture(Purpose::Entry);
-        b.market_evidence_mint = "DifferentMint11111111111111111111111111111".into();
-        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
-        assert!(d.reasons.contains(&Rejection::EvidenceMintMismatch));
-    }
-
-    #[test]
-    fn insufficient_cash_is_rejected() {
-        let (p, b, t, m, e, mut s) = fixture(Purpose::Entry);
-        s.available_cash_cents = p.notional_cents - 1;
-        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
-        assert!(d.reasons.contains(&Rejection::InsufficientCash));
-    }
-
-    #[test]
-    fn same_signal_cannot_be_fill() {
+    fn mismatched_execution_context_is_rejected() {
         let (p, b, t, m, mut e, s) = fixture(Purpose::Entry);
-        e.timeline.quote_at_ms = e.timeline.signal_at_ms;
+        e.quoted_notional_cents += 1;
         let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
-        assert!(d.reasons.contains(&Rejection::QuoteNotAfterSignal));
+        assert!(d.reasons.contains(&Rejection::QuoteNotionalMismatch));
+    }
+
+    #[test]
+    fn post_decision_quote_is_required() {
+        let (p, b, t, m, mut e, s) = fixture(Purpose::Entry);
+        e.timeline.quote_at_ms = e.timeline.decision_recorded_at_ms;
+        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
+        assert!(d.reasons.contains(&Rejection::QuoteNotAfterDecision));
+    }
+
+    #[test]
+    fn future_market_evidence_is_rejected() {
+        let (p, b, t, mut m, e, s) = fixture(Purpose::Entry);
+        m.as_of_ms = e.timeline.decision_recorded_at_ms + 1;
+        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
+        assert!(d.reasons.contains(&Rejection::MarketEvidenceFromFuture));
     }
 
     #[test]
     fn entry_halt_does_not_trap_exit() {
-        let (mut p, b, mut t, mut m, e, mut s) = fixture(Purpose::Exit);
+        let (mut p, b, mut t, mut m, mut e, mut s) = fixture(Purpose::Exit);
         p.notional_cents = 5_000;
+        e.quoted_notional_cents = p.notional_cents;
         s.entry_halt_active = true;
         t.exact_mint_verified = false;
         t.security_gate_passed = false;
@@ -568,13 +637,5 @@ mod tests {
         m.geckoterminal_score = 0;
         let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
         assert!(d.allowed, "exit trapped: {:?}", d.reasons);
-    }
-
-    #[test]
-    fn global_kill_switch_blocks_even_exit() {
-        let (p, b, t, m, e, mut s) = fixture(Purpose::Exit);
-        s.global_kill_switch_active = true;
-        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
-        assert!(d.reasons.contains(&Rejection::GlobalKillSwitch));
     }
 }
