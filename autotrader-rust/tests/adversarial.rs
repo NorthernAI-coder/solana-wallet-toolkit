@@ -195,8 +195,10 @@ fn portfolio_identity_and_accounting_are_fail_closed() {
 #[test]
 fn invalid_risk_configuration_fails_closed() {
     let f = fixture(Purpose::Entry);
-    let mut config = RiskConfig::default();
-    config.max_position_bps_of_nav = 0;
+    let config = RiskConfig {
+        max_position_bps_of_nav: 0,
+        ..RiskConfig::default()
+    };
     let r = PolicyEngine::new(config).evaluate(&f.0, &f.1, &f.2, &f.3, &f.4, &f.5);
     assert!(r.reasons.contains(&Rejection::RiskConfigInvalid));
 }
@@ -263,8 +265,10 @@ fn allowed_transfer_hook_still_requires_verified_program() {
     let mut f = fixture(Purpose::Entry);
     f.2.transfer_hook_present = true;
     f.2.transfer_hook_program_verified = false;
-    let mut config = RiskConfig::default();
-    config.allow_transfer_hook = true;
+    let config = RiskConfig {
+        allow_transfer_hook: true,
+        ..RiskConfig::default()
+    };
     let r = PolicyEngine::new(config).evaluate(&f.0, &f.1, &f.2, &f.3, &f.4, &f.5);
     assert!(r.reasons.contains(&Rejection::TransferHookUnverified));
 }
