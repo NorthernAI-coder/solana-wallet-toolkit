@@ -26,16 +26,16 @@ fn fixture(purpose: Purpose) -> Fixture {
         proposal.mint.as_str(),
         proposal.mint.as_str(),
     );
-    let decision = 3_500;
+    let decision = 995_000;
     let token = TokenEvidence {
-        checked_at_ms: 3_000,
+        checked_at_ms: 990_000,
         exact_mint_verified: true,
         security_gate_passed: true,
         dex_first_verified: true,
         entry_trigger_confirmed: true,
     };
     let market = MarketEvidence {
-        as_of_ms: 3_000,
+        as_of_ms: 994_000,
         liquidity_cents: 1_000_000,
         volume_24h_cents: 6_000_000,
         market_cap_cents: 30_000_000,
@@ -52,12 +52,12 @@ fn fixture(purpose: Purpose) -> Fixture {
         route_fee_bps: 500,
         price_divergence_bps: 500,
         timeline: TimelineEvidence {
-            observed_at_ms: 1_000,
-            armed_at_ms: 2_000,
-            signal_at_ms: 3_000,
+            observed_at_ms: 900_000,
+            armed_at_ms: 950_000,
+            signal_at_ms: 990_000,
             decision_recorded_at_ms: decision,
-            quote_at_ms: 4_000,
-            now_ms: 19_000,
+            quote_at_ms: 996_000,
+            now_ms: 1_011_000,
         },
     };
     let portfolio = PortfolioState {
@@ -180,8 +180,8 @@ fn post_decision_quote_and_quote_age_are_strict() {
     let r = engine.evaluate(&p, &b, &t, &m, &e, &s);
     assert!(r.reasons.contains(&Rejection::QuoteNotAfterDecision));
 
-    e.timeline.quote_at_ms = 4_000;
-    e.timeline.now_ms = 19_001;
+    e.timeline.quote_at_ms = 996_000;
+    e.timeline.now_ms = 1_011_001;
     let r = engine.evaluate(&p, &b, &t, &m, &e, &s);
     assert!(r.reasons.contains(&Rejection::QuoteStale));
 }
@@ -209,7 +209,7 @@ fn future_and_stale_token_evidence_are_denied_for_entries() {
     let r = engine.evaluate(&p, &b, &t, &m, &e, &s);
     assert!(r.reasons.contains(&Rejection::TokenEvidenceFromFuture));
 
-    t.checked_at_ms = e.timeline.decision_recorded_at_ms.saturating_sub(300_001);
+    t.checked_at_ms = e.timeline.decision_recorded_at_ms - 300_001;
     let r = engine.evaluate(&p, &b, &t, &m, &e, &s);
     assert!(r.reasons.contains(&Rejection::TokenEvidenceStale));
 }
