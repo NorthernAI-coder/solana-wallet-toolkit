@@ -80,14 +80,7 @@ pub fn run_adversarial_simulation(iterations: u64) -> SimulationReport {
             valid_entry_fixture(&mut rng, i);
         report.valid_entry_checks += 1;
         if !engine
-            .evaluate(
-                &proposal,
-                &binding,
-                &token,
-                &market,
-                &execution,
-                &portfolio,
-            )
+            .evaluate(&proposal, &binding, &token, &market, &execution, &portfolio)
             .allowed
         {
             report.false_rejects += 1;
@@ -127,8 +120,7 @@ pub fn run_adversarial_simulation(iterations: u64) -> SimulationReport {
 
         let mut stale_emergency = em_e;
         stale_emergency.timeline.quote_at_ms = stale_emergency.timeline.decision_recorded_at_ms;
-        let stale_report =
-            engine.evaluate(&em_p, &em_b, &em_t, &em_m, &stale_emergency, &em_s);
+        let stale_report = engine.evaluate(&em_p, &em_b, &em_t, &em_m, &stale_emergency, &em_s);
         if stale_report.allowed {
             report.false_accepts += 1;
         } else if stale_report
@@ -336,12 +328,12 @@ fn valid_exit_fixture(rng: &mut Lcg, i: u64, emergency: bool) -> Fixture {
     } else {
         Purpose::Exit
     };
-    let (slippage_cap, impact_cap, fee_cap, divergence_cap, sources, market_age_cap) =
-        if emergency {
-            (1_500, 1_200, 1_000, 2_000, 1, 300_000)
-        } else {
-            (300, 200, 500, 500, 2, 60_000)
-        };
+    let (slippage_cap, impact_cap, fee_cap, divergence_cap, sources, market_age_cap) = if emergency
+    {
+        (1_500, 1_200, 1_000, 2_000, 1, 300_000)
+    } else {
+        (300, 200, 500, 500, 2, 60_000)
+    };
     let proposal = ModelProposal {
         mint: format!("ExitMint{i:019}"),
         purpose,
