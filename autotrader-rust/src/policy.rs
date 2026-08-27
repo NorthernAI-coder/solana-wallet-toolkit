@@ -485,7 +485,9 @@ impl PolicyEngine {
                 if market.as_of_ms > t.decision_recorded_at_ms {
                     reasons.push(Rejection::MarketEvidenceFromFuture);
                 }
-                if execution.price_divergence_bps > self.config.emergency_exit_max_price_divergence_bps {
+                if execution.price_divergence_bps
+                    > self.config.emergency_exit_max_price_divergence_bps
+                {
                     reasons.push(Rejection::PriceSourceDivergence);
                 }
             }
