@@ -75,23 +75,15 @@ pub fn run_adversarial_simulation(iterations: u64) -> SimulationReport {
 
     for i in 0..iterations {
         let (proposal, binding, token, market, execution, portfolio) = valid_entry_fixture(&mut rng, i);
-
         report.valid_entry_checks += 1;
         if !engine
-            .evaluate(
-                &proposal,
-                &binding,
-                &token,
-                &market,
-                &execution,
-                &portfolio,
-            )
+            .evaluate(&proposal, &binding, &token, &market, &execution, &portfolio)
             .allowed
         {
             report.false_rejects += 1;
         }
 
-        let mutation = rng.next_u64() % 31;
+        let mutation = rng.next_u64() % 40;
         let (bad_p, bad_b, bad_t, bad_m, bad_e, bad_s) = mutate_entry_to_fail(
             mutation,
             proposal,
@@ -130,7 +122,7 @@ pub fn run_adversarial_simulation(iterations: u64) -> SimulationReport {
         }
 
         let mut stale_emergency = em_e;
-        stale_emergency.timeline.quote_at_ms = stale_emergency.timeline.signal_at_ms;
+        stale_emergency.timeline.quote_at_ms = stale_emergency.timeline.decision_recorded_at_ms;
         let stale_report = engine.evaluate(
             &em_p,
             &em_b,
@@ -141,7 +133,7 @@ pub fn run_adversarial_simulation(iterations: u64) -> SimulationReport {
         );
         if stale_report.allowed {
             report.false_accepts += 1;
-        } else if stale_report.reasons.contains(&Rejection::QuoteNotAfterSignal) {
+        } else if stale_report.reasons.contains(&Rejection::QuoteNotAfterDecision) {
             report.emergency_route_failures_caught += 1;
         }
     }
@@ -159,7 +151,8 @@ fn valid_entry_fixture(rng: &mut Lcg, i: u64) -> Fixture {
     let min_absorption = market_cap.saturating_mul(20) / 100;
     let volume = rng.range_u64(500_000.max(min_absorption), market_cap.max(500_000));
     let signal = 1_000_000u64.saturating_add(i.saturating_mul(100));
-    let quote = signal.saturating_add(rng.range_u64(1, 5_000));
+    let decision = signal.saturating_add(rng.range_u64(0, 2_000));
+    let quote = decision.saturating_add(rng.range_u64(1, 5_000));
     let now = quote.saturating_add(rng.range_u64(0, 15_000));
     let proposal = ModelProposal {
         mint: format!("SimMint{i:020}"),
@@ -183,18 +176,24 @@ fn valid_entry_fixture(rng: &mut Lcg, i: u64) -> Fixture {
         },
         reason: "simulation fixture".into(),
     };
-    let binding = EvidenceBinding::new(&proposal.mint, &proposal.mint, &proposal.mint);
+    let binding = EvidenceBinding::new(
+        proposal.mint.as_str(),
+        proposal.mint.as_str(),
+        proposal.mint.as_str(),
+    );
 
     (
         proposal,
         binding,
         TokenEvidence {
+            checked_at_ms: decision.saturating_sub(rng.range_u64(0, 300_000)),
             exact_mint_verified: true,
             security_gate_passed: true,
             dex_first_verified: true,
             entry_trigger_confirmed: true,
         },
         MarketEvidence {
+            as_of_ms: decision.saturating_sub(rng.range_u64(0, 60_000)),
             liquidity_cents: rng.range_u64(1_000_000, 20_000_000),
             volume_24h_cents: volume,
             market_cap_cents: market_cap,
@@ -202,6 +201,9 @@ fn valid_entry_fixture(rng: &mut Lcg, i: u64) -> Fixture {
             independent_price_sources: rng.range_u64(2, 5) as u8,
         },
         ExecutionEvidence {
+            mode: proposal.mode,
+            purpose: proposal.purpose,
+            quoted_notional_cents: proposal.notional_cents,
             route_verified: true,
             slippage_bps: rng.range_u32(0, 300),
             price_impact_bps: rng.range_u32(0, 200),
@@ -211,6 +213,7 @@ fn valid_entry_fixture(rng: &mut Lcg, i: u64) -> Fixture {
                 observed_at_ms: signal.saturating_sub(10_000),
                 armed_at_ms: signal.saturating_sub(5_000),
                 signal_at_ms: signal,
+                decision_recorded_at_ms: decision,
                 quote_at_ms: quote,
                 now_ms: now,
             },
@@ -248,52 +251,82 @@ fn mutate_entry_to_fail(
         1 => s.entry_halt_active = true,
         2 => e.route_verified = false,
         3 => e.timeline.quote_at_ms = e.timeline.signal_at_ms,
-        4 => e.timeline.quote_at_ms = e.timeline.now_ms.saturating_add(1),
-        5 => {
+        4 => e.timeline.quote_at_ms = e.timeline.decision_recorded_at_ms,
+        5 => e.timeline.quote_at_ms = e.timeline.now_ms.saturating_add(1),
+        6 => {
             e.timeline.now_ms = e
                 .timeline
                 .quote_at_ms
                 .saturating_add(c.max_quote_age_ms)
                 .saturating_add(1)
         }
-        6 => e.timeline.armed_at_ms = e.timeline.signal_at_ms.saturating_add(1),
-        7 => e.price_divergence_bps = c.max_price_divergence_bps.saturating_add(1),
-        8 => m.independent_price_sources = c.min_independent_price_sources.saturating_sub(1),
-        9 => b.token_evidence_mint.push('X'),
-        10 => b.market_evidence_mint.push('X'),
-        11 => b.execution_evidence_mint.push('X'),
-        12 => t.exact_mint_verified = false,
-        13 => t.security_gate_passed = false,
-        14 => t.dex_first_verified = false,
-        15 => t.entry_trigger_confirmed = false,
-        16 => m.liquidity_cents = c.min_liquidity_cents.saturating_sub(1),
-        17 => m.volume_24h_cents = c.min_volume_24h_cents.saturating_sub(1),
-        18 => m.market_cap_cents = 0,
-        19 => m.market_cap_cents = c.max_market_cap_cents.saturating_add(1),
-        20 => {
+        7 => e.timeline.armed_at_ms = e.timeline.signal_at_ms.saturating_add(1),
+        8 => m.as_of_ms = e.timeline.decision_recorded_at_ms.saturating_add(1),
+        9 => {
+            m.as_of_ms = e
+                .timeline
+                .decision_recorded_at_ms
+                .saturating_sub(c.max_market_evidence_age_ms.saturating_add(1))
+        }
+        10 => t.checked_at_ms = e.timeline.decision_recorded_at_ms.saturating_add(1),
+        11 => {
+            t.checked_at_ms = e
+                .timeline
+                .decision_recorded_at_ms
+                .saturating_sub(c.max_token_evidence_age_ms.saturating_add(1))
+        }
+        12 => e.price_divergence_bps = c.max_price_divergence_bps.saturating_add(1),
+        13 => m.independent_price_sources = c.min_independent_price_sources.saturating_sub(1),
+        14 => b.token_evidence_mint.push('X'),
+        15 => b.market_evidence_mint.push('X'),
+        16 => b.execution_evidence_mint.push('X'),
+        17 => {
+            e.mode = if p.mode == ExecutionMode::Paper {
+                ExecutionMode::Shadow
+            } else {
+                ExecutionMode::Paper
+            }
+        }
+        18 => e.purpose = Purpose::Exit,
+        19 => e.quoted_notional_cents = p.notional_cents.saturating_add(1),
+        20 => t.exact_mint_verified = false,
+        21 => t.security_gate_passed = false,
+        22 => t.dex_first_verified = false,
+        23 => t.entry_trigger_confirmed = false,
+        24 => m.liquidity_cents = c.min_liquidity_cents.saturating_sub(1),
+        25 => m.volume_24h_cents = c.min_volume_24h_cents.saturating_sub(1),
+        26 => m.market_cap_cents = 0,
+        27 => m.market_cap_cents = c.max_market_cap_cents.saturating_add(1),
+        28 => {
             m.market_cap_cents = c.max_market_cap_cents.max(10_000);
             m.volume_24h_cents = m.market_cap_cents.saturating_mul(19) / 100;
         }
-        21 => m.geckoterminal_score = c.min_geckoterminal_score.saturating_sub(1),
-        22 => e.slippage_bps = c.max_slippage_bps.saturating_add(1),
-        23 => e.price_impact_bps = c.max_price_impact_bps.saturating_add(1),
-        24 => e.route_fee_bps = c.max_route_fee_bps.saturating_add(1),
-        25 => s.daily_realized_loss_cents = s.nav_cents.saturating_mul(5) / 100,
-        26 => p.notional_cents = (s.nav_cents / 10).saturating_add(1),
-        27 => {
+        29 => m.geckoterminal_score = c.min_geckoterminal_score.saturating_sub(1),
+        30 => e.slippage_bps = c.max_slippage_bps.saturating_add(1),
+        31 => e.price_impact_bps = c.max_price_impact_bps.saturating_add(1),
+        32 => e.route_fee_bps = c.max_route_fee_bps.saturating_add(1),
+        33 => s.daily_realized_loss_cents = s.nav_cents.saturating_mul(5) / 100,
+        34 => p.notional_cents = (s.nav_cents / 10).saturating_add(1),
+        35 => {
             p.notional_cents = 1;
+            e.quoted_notional_cents = 1;
             s.total_exposure_cents = s.nav_cents.saturating_mul(4) / 10;
         }
-        28 => s.open_positions = c.max_open_positions,
-        29 => s.available_cash_cents = p.notional_cents.saturating_sub(1),
-        _ => p.notional_cents = 0,
+        36 => s.open_positions = c.max_open_positions,
+        37 => s.available_cash_cents = p.notional_cents.saturating_sub(1),
+        38 => {
+            p.notional_cents = 0;
+            e.quoted_notional_cents = 0;
+        }
+        _ => e.timeline.decision_recorded_at_ms = e.timeline.signal_at_ms.saturating_sub(1),
     }
     (p, b, t, m, e, s)
 }
 
 fn valid_exit_fixture(rng: &mut Lcg, i: u64, emergency: bool) -> Fixture {
     let signal = 10_000_000u64.saturating_add(i.saturating_mul(100));
-    let quote = signal.saturating_add(rng.range_u64(1, 2_000));
+    let decision = signal.saturating_add(rng.range_u64(0, 1_000));
+    let quote = decision.saturating_add(rng.range_u64(1, 2_000));
     let position = rng.range_u64(1_000, 100_000);
     let amount = rng.range_u64(1, position);
     let purpose = if emergency {
@@ -301,10 +334,10 @@ fn valid_exit_fixture(rng: &mut Lcg, i: u64, emergency: bool) -> Fixture {
     } else {
         Purpose::Exit
     };
-    let (slippage_cap, impact_cap, fee_cap, divergence_cap, sources) = if emergency {
-        (1_500, 1_200, 1_000, 2_000, 1)
+    let (slippage_cap, impact_cap, fee_cap, divergence_cap, sources, market_age_cap) = if emergency {
+        (1_500, 1_200, 1_000, 2_000, 1, 300_000)
     } else {
-        (300, 200, 500, 500, 2)
+        (300, 200, 500, 500, 2, 60_000)
     };
     let proposal = ModelProposal {
         mint: format!("ExitMint{i:019}"),
@@ -323,18 +356,24 @@ fn valid_exit_fixture(rng: &mut Lcg, i: u64, emergency: bool) -> Fixture {
         }
         .into(),
     };
-    let binding = EvidenceBinding::new(&proposal.mint, &proposal.mint, &proposal.mint);
+    let binding = EvidenceBinding::new(
+        proposal.mint.as_str(),
+        proposal.mint.as_str(),
+        proposal.mint.as_str(),
+    );
 
     (
         proposal,
         binding,
         TokenEvidence {
+            checked_at_ms: decision,
             exact_mint_verified: false,
             security_gate_passed: false,
             dex_first_verified: false,
             entry_trigger_confirmed: false,
         },
         MarketEvidence {
+            as_of_ms: decision.saturating_sub(rng.range_u64(0, market_age_cap)),
             liquidity_cents: 0,
             volume_24h_cents: 0,
             market_cap_cents: 0,
@@ -342,6 +381,9 @@ fn valid_exit_fixture(rng: &mut Lcg, i: u64, emergency: bool) -> Fixture {
             independent_price_sources: sources,
         },
         ExecutionEvidence {
+            mode: proposal.mode,
+            purpose: proposal.purpose,
+            quoted_notional_cents: proposal.notional_cents,
             route_verified: true,
             slippage_bps: rng.range_u32(0, slippage_cap),
             price_impact_bps: rng.range_u32(0, impact_cap),
@@ -351,6 +393,7 @@ fn valid_exit_fixture(rng: &mut Lcg, i: u64, emergency: bool) -> Fixture {
                 observed_at_ms: signal.saturating_sub(5_000),
                 armed_at_ms: signal.saturating_add(100),
                 signal_at_ms: signal,
+                decision_recorded_at_ms: decision,
                 quote_at_ms: quote,
                 now_ms: quote.saturating_add(rng.range_u64(0, 15_000)),
             },
