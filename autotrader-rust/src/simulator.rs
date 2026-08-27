@@ -91,7 +91,7 @@ pub fn run_adversarial_simulation(iterations: u64) -> SimulationReport {
             report.false_rejects += 1;
         }
 
-        let mutation = rng.next_u64() % 30;
+        let mutation = rng.next_u64() % 31;
         let (bad_p, bad_b, bad_t, bad_m, bad_e, bad_s) = mutate_entry_to_fail(
             mutation,
             proposal,
@@ -183,7 +183,7 @@ fn valid_entry_fixture(rng: &mut Lcg, i: u64) -> Fixture {
         },
         reason: "simulation fixture".into(),
     };
-    let binding = EvidenceBinding::for_mint(&proposal.mint);
+    let binding = EvidenceBinding::new(&proposal.mint, &proposal.mint, &proposal.mint);
 
     (
         proposal,
@@ -217,6 +217,7 @@ fn valid_entry_fixture(rng: &mut Lcg, i: u64) -> Fixture {
         },
         PortfolioState {
             nav_cents: nav,
+            available_cash_cents: nav.saturating_sub(total_exposure),
             total_exposure_cents: total_exposure,
             daily_realized_loss_cents: rng.range_u64(
                 0,
@@ -284,6 +285,7 @@ fn mutate_entry_to_fail(
             s.total_exposure_cents = s.nav_cents.saturating_mul(4) / 10;
         }
         28 => s.open_positions = c.max_open_positions,
+        29 => s.available_cash_cents = p.notional_cents.saturating_sub(1),
         _ => p.notional_cents = 0,
     }
     (p, b, t, m, e, s)
@@ -321,7 +323,7 @@ fn valid_exit_fixture(rng: &mut Lcg, i: u64, emergency: bool) -> Fixture {
         }
         .into(),
     };
-    let binding = EvidenceBinding::for_mint(&proposal.mint);
+    let binding = EvidenceBinding::new(&proposal.mint, &proposal.mint, &proposal.mint);
 
     (
         proposal,
@@ -355,6 +357,7 @@ fn valid_exit_fixture(rng: &mut Lcg, i: u64, emergency: bool) -> Fixture {
         },
         PortfolioState {
             nav_cents: 100_000,
+            available_cash_cents: 0,
             total_exposure_cents: position,
             daily_realized_loss_cents: 100_000,
             open_positions: 5,
