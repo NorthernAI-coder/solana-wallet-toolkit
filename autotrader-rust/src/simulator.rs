@@ -3,6 +3,8 @@ use crate::policy::{
     PolicyEngine, PortfolioState, Purpose, Rejection, RiskConfig, TimelineEvidence, TokenEvidence,
 };
 
+const ENTRY_MUTATION_CLASSES: u64 = 40;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SimulationReport {
     pub iterations: u64,
@@ -74,25 +76,27 @@ pub fn run_adversarial_simulation(iterations: u64) -> SimulationReport {
     };
 
     for i in 0..iterations {
-        let (proposal, binding, token, market, execution, portfolio) = valid_entry_fixture(&mut rng, i);
+        let (proposal, binding, token, market, execution, portfolio) =
+            valid_entry_fixture(&mut rng, i);
         report.valid_entry_checks += 1;
         if !engine
-            .evaluate(&proposal, &binding, &token, &market, &execution, &portfolio)
+            .evaluate(
+                &proposal,
+                &binding,
+                &token,
+                &market,
+                &execution,
+                &portfolio,
+            )
             .allowed
         {
             report.false_rejects += 1;
         }
 
-        let mutation = rng.next_u64() % 40;
+        // Cycle deterministically so every corruption class is guaranteed coverage.
+        let mutation = i % ENTRY_MUTATION_CLASSES;
         let (bad_p, bad_b, bad_t, bad_m, bad_e, bad_s) = mutate_entry_to_fail(
-            mutation,
-            proposal,
-            binding,
-            token,
-            market,
-            execution,
-            portfolio,
-            &engine,
+            mutation, proposal, binding, token, market, execution, portfolio, &engine,
         );
         report.invalid_entry_checks += 1;
         if engine
@@ -123,17 +127,14 @@ pub fn run_adversarial_simulation(iterations: u64) -> SimulationReport {
 
         let mut stale_emergency = em_e;
         stale_emergency.timeline.quote_at_ms = stale_emergency.timeline.decision_recorded_at_ms;
-        let stale_report = engine.evaluate(
-            &em_p,
-            &em_b,
-            &em_t,
-            &em_m,
-            &stale_emergency,
-            &em_s,
-        );
+        let stale_report =
+            engine.evaluate(&em_p, &em_b, &em_t, &em_m, &stale_emergency, &em_s);
         if stale_report.allowed {
             report.false_accepts += 1;
-        } else if stale_report.reasons.contains(&Rejection::QuoteNotAfterDecision) {
+        } else if stale_report
+            .reasons
+            .contains(&Rejection::QuoteNotAfterDecision)
+        {
             report.emergency_route_failures_caught += 1;
         }
     }
@@ -181,6 +182,9 @@ fn valid_entry_fixture(rng: &mut Lcg, i: u64) -> Fixture {
         proposal.mint.as_str(),
         proposal.mint.as_str(),
     );
+    let execution_mode = proposal.mode;
+    let execution_purpose = proposal.purpose;
+    let quoted_notional_cents = proposal.notional_cents;
 
     (
         proposal,
@@ -201,9 +205,9 @@ fn valid_entry_fixture(rng: &mut Lcg, i: u64) -> Fixture {
             independent_price_sources: rng.range_u64(2, 5) as u8,
         },
         ExecutionEvidence {
-            mode: proposal.mode,
-            purpose: proposal.purpose,
-            quoted_notional_cents: proposal.notional_cents,
+            mode: execution_mode,
+            purpose: execution_purpose,
+            quoted_notional_cents,
             route_verified: true,
             slippage_bps: rng.range_u32(0, 300),
             price_impact_bps: rng.range_u32(0, 200),
@@ -222,10 +226,8 @@ fn valid_entry_fixture(rng: &mut Lcg, i: u64) -> Fixture {
             nav_cents: nav,
             available_cash_cents: nav.saturating_sub(total_exposure),
             total_exposure_cents: total_exposure,
-            daily_realized_loss_cents: rng.range_u64(
-                0,
-                (nav.saturating_mul(5) / 100).saturating_sub(1),
-            ),
+            daily_realized_loss_cents: rng
+                .range_u64(0, (nav.saturating_mul(5) / 100).saturating_sub(1)),
             open_positions: rng.range_u64(0, 4) as u16,
             current_position_value_cents: notional,
             entry_halt_active: false,
@@ -334,11 +336,12 @@ fn valid_exit_fixture(rng: &mut Lcg, i: u64, emergency: bool) -> Fixture {
     } else {
         Purpose::Exit
     };
-    let (slippage_cap, impact_cap, fee_cap, divergence_cap, sources, market_age_cap) = if emergency {
-        (1_500, 1_200, 1_000, 2_000, 1, 300_000)
-    } else {
-        (300, 200, 500, 500, 2, 60_000)
-    };
+    let (slippage_cap, impact_cap, fee_cap, divergence_cap, sources, market_age_cap) =
+        if emergency {
+            (1_500, 1_200, 1_000, 2_000, 1, 300_000)
+        } else {
+            (300, 200, 500, 500, 2, 60_000)
+        };
     let proposal = ModelProposal {
         mint: format!("ExitMint{i:019}"),
         purpose,
@@ -361,6 +364,9 @@ fn valid_exit_fixture(rng: &mut Lcg, i: u64, emergency: bool) -> Fixture {
         proposal.mint.as_str(),
         proposal.mint.as_str(),
     );
+    let execution_mode = proposal.mode;
+    let execution_purpose = proposal.purpose;
+    let quoted_notional_cents = proposal.notional_cents;
 
     (
         proposal,
@@ -381,9 +387,9 @@ fn valid_exit_fixture(rng: &mut Lcg, i: u64, emergency: bool) -> Fixture {
             independent_price_sources: sources,
         },
         ExecutionEvidence {
-            mode: proposal.mode,
-            purpose: proposal.purpose,
-            quoted_notional_cents: proposal.notional_cents,
+            mode: execution_mode,
+            purpose: execution_purpose,
+            quoted_notional_cents,
             route_verified: true,
             slippage_bps: rng.range_u32(0, slippage_cap),
             price_impact_bps: rng.range_u32(0, impact_cap),
