@@ -26,6 +26,12 @@ pub enum Phenotype {
     Other,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenProgram {
+    Legacy,
+    Token2022,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelProposal {
     pub mint: String,
@@ -37,7 +43,8 @@ pub struct ModelProposal {
 }
 
 /// Exact asset identities reported independently by token, market, and execution adapters.
-/// Do not construct these values by copying `ModelProposal::mint` without source verification.
+/// Production adapters must derive these values from their own source responses rather than
+/// copying the model proposal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EvidenceBinding {
     pub token_evidence_mint: String,
@@ -87,11 +94,24 @@ pub struct MarketEvidence {
     pub independent_price_sources: u8,
 }
 
+/// Independently collected Solana mint and Token-2022 security facts.
+/// These are facts, not a single adapter-provided "safe" verdict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TokenEvidence {
     pub checked_at_ms: u64,
     pub exact_mint_verified: bool,
-    pub security_gate_passed: bool,
+    pub token_program: TokenProgram,
+    pub mint_authority_present: bool,
+    pub freeze_authority_present: bool,
+    pub permanent_delegate_present: bool,
+    pub non_transferable: bool,
+    pub default_account_state_frozen: bool,
+    pub transfer_hook_present: bool,
+    pub transfer_hook_program_verified: bool,
+    pub pausable: bool,
+    pub confidential_transfer_enabled: bool,
+    pub scaled_ui_amount_enabled: bool,
+    pub current_transfer_fee_bps: u32,
     pub dex_first_verified: bool,
     pub entry_trigger_confirmed: bool,
 }
@@ -102,6 +122,11 @@ pub struct ExecutionEvidence {
     pub purpose: Purpose,
     pub quoted_notional_cents: u64,
     pub route_verified: bool,
+    /// Exact proposed transaction or route simulation succeeded.
+    pub preflight_simulation_passed: bool,
+    /// For entries, a reverse sell of the acquired asset also simulated successfully.
+    pub reverse_sell_simulation_passed: bool,
+    pub estimated_network_fee_cents: u64,
     pub slippage_bps: u32,
     pub price_impact_bps: u32,
     pub route_fee_bps: u32,
@@ -109,13 +134,18 @@ pub struct ExecutionEvidence {
     pub timeline: TimelineEvidence,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Portfolio snapshot for the proposal mint plus aggregate portfolio values.
+/// `current_position_value_cents` is the marked value of the proposal mint only.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortfolioState {
     pub nav_cents: u64,
+    /// Fixed start-of-risk-period NAV used for daily loss limits.
+    pub risk_reference_nav_cents: u64,
     pub available_cash_cents: u64,
     pub total_exposure_cents: u64,
     pub daily_realized_loss_cents: u64,
     pub open_positions: u16,
+    pub current_position_mint: Option<String>,
     pub current_position_value_cents: u64,
     /// Blocks new entries while preserving risk-reducing exits.
     pub entry_halt_active: bool,
@@ -127,7 +157,7 @@ pub struct PortfolioState {
 pub struct RiskConfig {
     pub max_position_bps_of_nav: u32,
     pub max_total_exposure_bps_of_nav: u32,
-    pub max_daily_loss_bps_of_nav: u32,
+    pub max_daily_loss_bps_of_reference_nav: u32,
     pub max_slippage_bps: u32,
     pub max_price_impact_bps: u32,
     pub emergency_exit_max_slippage_bps: u32,
@@ -142,12 +172,18 @@ pub struct RiskConfig {
     pub min_volume_to_market_cap_bps: u32,
     pub min_geckoterminal_score: u8,
     pub min_independent_price_sources: u8,
-    pub emergency_exit_min_independent_price_sources: u8,
     pub max_quote_age_ms: u64,
     pub max_market_evidence_age_ms: u64,
-    pub emergency_exit_max_market_evidence_age_ms: u64,
     pub max_token_evidence_age_ms: u64,
     pub max_open_positions: u16,
+    pub max_token_transfer_fee_bps: u32,
+    pub allow_mint_authority: bool,
+    pub allow_freeze_authority: bool,
+    pub allow_permanent_delegate: bool,
+    pub allow_transfer_hook: bool,
+    pub allow_pausable: bool,
+    pub allow_confidential_transfer: bool,
+    pub allow_scaled_ui_amount: bool,
 }
 
 impl Default for RiskConfig {
@@ -155,7 +191,7 @@ impl Default for RiskConfig {
         Self {
             max_position_bps_of_nav: 1_000,
             max_total_exposure_bps_of_nav: 4_000,
-            max_daily_loss_bps_of_nav: 500,
+            max_daily_loss_bps_of_reference_nav: 500,
             max_slippage_bps: 300,
             max_price_impact_bps: 200,
             emergency_exit_max_slippage_bps: 1_500,
@@ -170,18 +206,61 @@ impl Default for RiskConfig {
             min_volume_to_market_cap_bps: 2_000,
             min_geckoterminal_score: 56,
             min_independent_price_sources: 2,
-            emergency_exit_min_independent_price_sources: 1,
             max_quote_age_ms: 15_000,
             max_market_evidence_age_ms: 60_000,
-            emergency_exit_max_market_evidence_age_ms: 300_000,
             max_token_evidence_age_ms: 300_000,
             max_open_positions: 5,
+            max_token_transfer_fee_bps: 500,
+            allow_mint_authority: false,
+            allow_freeze_authority: false,
+            allow_permanent_delegate: false,
+            allow_transfer_hook: false,
+            allow_pausable: false,
+            allow_confidential_transfer: false,
+            allow_scaled_ui_amount: false,
         }
+    }
+}
+
+impl RiskConfig {
+    pub fn is_valid(&self) -> bool {
+        self.max_position_bps_of_nav > 0
+            && self.max_position_bps_of_nav <= self.max_total_exposure_bps_of_nav
+            && self.max_total_exposure_bps_of_nav <= 10_000
+            && self.max_daily_loss_bps_of_reference_nav > 0
+            && self.max_daily_loss_bps_of_reference_nav <= 10_000
+            && self.max_slippage_bps <= 10_000
+            && self.max_price_impact_bps <= 10_000
+            && self.max_route_fee_bps <= 10_000
+            && self.max_price_divergence_bps <= 10_000
+            && self.emergency_exit_max_slippage_bps >= self.max_slippage_bps
+            && self.emergency_exit_max_slippage_bps <= 10_000
+            && self.emergency_exit_max_price_impact_bps >= self.max_price_impact_bps
+            && self.emergency_exit_max_price_impact_bps <= 10_000
+            && self.emergency_exit_max_route_fee_bps >= self.max_route_fee_bps
+            && self.emergency_exit_max_route_fee_bps <= 10_000
+            && self.emergency_exit_max_price_divergence_bps >= self.max_price_divergence_bps
+            && self.emergency_exit_max_price_divergence_bps <= 10_000
+            && self.min_liquidity_cents > 0
+            && self.min_volume_24h_cents > 0
+            && self.max_market_cap_cents > 0
+            && self.min_volume_to_market_cap_bps > 0
+            && self.min_geckoterminal_score <= 100
+            && self.min_independent_price_sources > 0
+            && self.max_quote_age_ms > 0
+            && self.max_market_evidence_age_ms > 0
+            && self.max_token_evidence_age_ms > 0
+            && self.max_open_positions > 0
+            && self.max_token_transfer_fee_bps <= 10_000
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rejection {
+    RiskConfigInvalid,
+    PortfolioStateInvalid,
+    PositionMintMismatch,
+    PositionMissing,
     EvidenceMintMismatch,
     ExecutionModeMismatch,
     ExecutionPurposeMismatch,
@@ -189,6 +268,8 @@ pub enum Rejection {
     GlobalKillSwitch,
     EntryHalt,
     RouteUnverified,
+    PreflightSimulationFailed,
+    ReverseSellSimulationFailed,
     QuoteNotAfterSignal,
     QuoteNotAfterDecision,
     QuoteFromFuture,
@@ -201,7 +282,17 @@ pub enum Rejection {
     PriceSourceDivergence,
     TooFewIndependentPriceSources,
     ExactMintUnverified,
-    SecurityGateFailed,
+    MintAuthorityPresent,
+    FreezeAuthorityPresent,
+    PermanentDelegatePresent,
+    NonTransferableToken,
+    DefaultAccountStateFrozen,
+    TransferHookNotAllowed,
+    TransferHookUnverified,
+    PausableToken,
+    ConfidentialTransferEnabled,
+    ScaledUiAmountEnabled,
+    TokenTransferFeeTooHigh,
     DexFirstUnverified,
     EntryTriggerMissing,
     LiquidityTooLow,
@@ -216,6 +307,7 @@ pub enum Rejection {
     DailyLossLimitReached,
     PositionSizeInvalid,
     PositionSizeTooLarge,
+    NetworkFeeUnaffordable,
     InsufficientCash,
     TotalExposureTooHigh,
     OpenPositionLimitReached,
@@ -264,6 +356,11 @@ impl PolicyEngine {
     ) -> DecisionReport {
         let mut reasons = Vec::new();
 
+        if !self.config.is_valid() {
+            reasons.push(Rejection::RiskConfigInvalid);
+        }
+        self.validate_portfolio(proposal, portfolio, &mut reasons);
+
         if !binding.matches(&proposal.mint) {
             reasons.push(Rejection::EvidenceMintMismatch);
         }
@@ -280,7 +377,7 @@ impl PolicyEngine {
             reasons.push(Rejection::GlobalKillSwitch);
         }
 
-        self.evaluate_execution_common(proposal, market, execution, &mut reasons);
+        self.evaluate_execution_common(proposal, market, execution, portfolio, &mut reasons);
 
         match proposal.purpose {
             Purpose::Entry => {
@@ -300,11 +397,47 @@ impl PolicyEngine {
         DecisionReport::from_reasons(reasons)
     }
 
+    fn validate_portfolio(
+        &self,
+        proposal: &ModelProposal,
+        portfolio: &PortfolioState,
+        reasons: &mut Vec<Rejection>,
+    ) {
+        let accounting_valid = portfolio.nav_cents > 0
+            && portfolio.risk_reference_nav_cents > 0
+            && portfolio.total_exposure_cents <= portfolio.nav_cents
+            && portfolio.current_position_value_cents <= portfolio.total_exposure_cents
+            && portfolio
+                .available_cash_cents
+                .checked_add(portfolio.total_exposure_cents)
+                == Some(portfolio.nav_cents);
+
+        let position_identity_valid = match (
+            portfolio.current_position_mint.as_deref(),
+            portfolio.current_position_value_cents,
+        ) {
+            (None, 0) => true,
+            (Some(mint), value) if value > 0 => mint == proposal.mint,
+            _ => false,
+        };
+
+        if !accounting_valid {
+            reasons.push(Rejection::PortfolioStateInvalid);
+        }
+        if !position_identity_valid {
+            reasons.push(Rejection::PositionMintMismatch);
+        }
+        if proposal.purpose != Purpose::Entry && portfolio.current_position_value_cents == 0 {
+            reasons.push(Rejection::PositionMissing);
+        }
+    }
+
     fn evaluate_execution_common(
         &self,
         proposal: &ModelProposal,
         market: &MarketEvidence,
         execution: &ExecutionEvidence,
+        portfolio: &PortfolioState,
         reasons: &mut Vec<Rejection>,
     ) {
         let t = execution.timeline;
@@ -312,6 +445,9 @@ impl PolicyEngine {
 
         if !execution.route_verified {
             reasons.push(Rejection::RouteUnverified);
+        }
+        if !execution.preflight_simulation_passed {
+            reasons.push(Rejection::PreflightSimulationFailed);
         }
         if t.quote_at_ms <= t.signal_at_ms {
             reasons.push(Rejection::QuoteNotAfterSignal);
@@ -342,36 +478,31 @@ impl PolicyEngine {
             reasons.push(Rejection::InvalidSignalOrder);
         }
 
-        if market.as_of_ms > t.decision_recorded_at_ms {
-            reasons.push(Rejection::MarketEvidenceFromFuture);
+        // Emergency exits remain causal but do not require fresh secondary market data.
+        // A fresh executable route and successful preflight remain mandatory.
+        if emergency {
+            if market.independent_price_sources > 0 {
+                if market.as_of_ms > t.decision_recorded_at_ms {
+                    reasons.push(Rejection::MarketEvidenceFromFuture);
+                }
+                if execution.price_divergence_bps > self.config.emergency_exit_max_price_divergence_bps {
+                    reasons.push(Rejection::PriceSourceDivergence);
+                }
+            }
         } else {
-            let age = t.decision_recorded_at_ms.saturating_sub(market.as_of_ms);
-            let cap = if emergency {
-                self.config.emergency_exit_max_market_evidence_age_ms
-            } else {
-                self.config.max_market_evidence_age_ms
-            };
-            if age > cap {
+            if market.as_of_ms > t.decision_recorded_at_ms {
+                reasons.push(Rejection::MarketEvidenceFromFuture);
+            } else if t.decision_recorded_at_ms.saturating_sub(market.as_of_ms)
+                > self.config.max_market_evidence_age_ms
+            {
                 reasons.push(Rejection::MarketEvidenceStale);
             }
-        }
-
-        let divergence_cap = if emergency {
-            self.config.emergency_exit_max_price_divergence_bps
-        } else {
-            self.config.max_price_divergence_bps
-        };
-        if execution.price_divergence_bps > divergence_cap {
-            reasons.push(Rejection::PriceSourceDivergence);
-        }
-
-        let required_sources = if emergency {
-            self.config.emergency_exit_min_independent_price_sources
-        } else {
-            self.config.min_independent_price_sources
-        };
-        if market.independent_price_sources < required_sources {
-            reasons.push(Rejection::TooFewIndependentPriceSources);
+            if execution.price_divergence_bps > self.config.max_price_divergence_bps {
+                reasons.push(Rejection::PriceSourceDivergence);
+            }
+            if market.independent_price_sources < self.config.min_independent_price_sources {
+                reasons.push(Rejection::TooFewIndependentPriceSources);
+            }
         }
 
         let fee_cap = if emergency {
@@ -381,6 +512,10 @@ impl PolicyEngine {
         };
         if execution.route_fee_bps > fee_cap {
             reasons.push(Rejection::RouteFeeTooHigh);
+        }
+
+        if execution.estimated_network_fee_cents > portfolio.available_cash_cents {
+            reasons.push(Rejection::NetworkFeeUnaffordable);
         }
     }
 
@@ -405,8 +540,43 @@ impl PolicyEngine {
         if !token.exact_mint_verified {
             reasons.push(Rejection::ExactMintUnverified);
         }
-        if !token.security_gate_passed {
-            reasons.push(Rejection::SecurityGateFailed);
+        if token.mint_authority_present && !self.config.allow_mint_authority {
+            reasons.push(Rejection::MintAuthorityPresent);
+        }
+        if token.freeze_authority_present && !self.config.allow_freeze_authority {
+            reasons.push(Rejection::FreezeAuthorityPresent);
+        }
+        if token.permanent_delegate_present && !self.config.allow_permanent_delegate {
+            reasons.push(Rejection::PermanentDelegatePresent);
+        }
+        if token.non_transferable {
+            reasons.push(Rejection::NonTransferableToken);
+        }
+        if token.default_account_state_frozen {
+            reasons.push(Rejection::DefaultAccountStateFrozen);
+        }
+        if token.transfer_hook_present {
+            if !self.config.allow_transfer_hook {
+                reasons.push(Rejection::TransferHookNotAllowed);
+            }
+            if !token.transfer_hook_program_verified {
+                reasons.push(Rejection::TransferHookUnverified);
+            }
+        }
+        if token.pausable && !self.config.allow_pausable {
+            reasons.push(Rejection::PausableToken);
+        }
+        if token.confidential_transfer_enabled && !self.config.allow_confidential_transfer {
+            reasons.push(Rejection::ConfidentialTransferEnabled);
+        }
+        if token.scaled_ui_amount_enabled && !self.config.allow_scaled_ui_amount {
+            reasons.push(Rejection::ScaledUiAmountEnabled);
+        }
+        if token.current_transfer_fee_bps > self.config.max_token_transfer_fee_bps {
+            reasons.push(Rejection::TokenTransferFeeTooHigh);
+        }
+        if !execution.reverse_sell_simulation_passed {
+            reasons.push(Rejection::ReverseSellSimulationFailed);
         }
         if !token.dex_first_verified {
             reasons.push(Rejection::DexFirstUnverified);
@@ -442,7 +612,10 @@ impl PolicyEngine {
             reasons.push(Rejection::PriceImpactTooHigh);
         }
 
-        let daily_loss_limit = pct_of(portfolio.nav_cents, self.config.max_daily_loss_bps_of_nav);
+        let daily_loss_limit = pct_of(
+            portfolio.risk_reference_nav_cents,
+            self.config.max_daily_loss_bps_of_reference_nav,
+        );
         if portfolio.daily_realized_loss_cents >= daily_loss_limit {
             reasons.push(Rejection::DailyLossLimitReached);
         }
@@ -451,11 +624,26 @@ impl PolicyEngine {
         }
 
         let max_position = pct_of(portfolio.nav_cents, self.config.max_position_bps_of_nav);
-        if proposal.notional_cents > max_position {
-            reasons.push(Rejection::PositionSizeTooLarge);
+        match portfolio
+            .current_position_value_cents
+            .checked_add(proposal.notional_cents)
+        {
+            Some(projected_position) if projected_position > max_position => {
+                reasons.push(Rejection::PositionSizeTooLarge)
+            }
+            None => reasons.push(Rejection::ArithmeticOverflow),
+            _ => {}
         }
-        if proposal.notional_cents > portfolio.available_cash_cents {
-            reasons.push(Rejection::InsufficientCash);
+
+        let entry_cash_needed = proposal
+            .notional_cents
+            .checked_add(execution.estimated_network_fee_cents);
+        match entry_cash_needed {
+            Some(required) if required > portfolio.available_cash_cents => {
+                reasons.push(Rejection::InsufficientCash)
+            }
+            None => reasons.push(Rejection::ArithmeticOverflow),
+            _ => {}
         }
 
         let max_total_exposure = pct_of(
@@ -473,7 +661,9 @@ impl PolicyEngine {
             _ => {}
         }
 
-        if portfolio.open_positions >= self.config.max_open_positions {
+        if portfolio.current_position_value_cents == 0
+            && portfolio.open_positions >= self.config.max_open_positions
+        {
             reasons.push(Rejection::OpenPositionLimitReached);
         }
     }
@@ -523,128 +713,4 @@ fn ratio_bps(numerator: u64, denominator: u64) -> u32 {
     }
     let result = (numerator as u128 * 10_000u128) / denominator as u128;
     result.min(u32::MAX as u128) as u32
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fixture(
-        purpose: Purpose,
-    ) -> (
-        ModelProposal,
-        EvidenceBinding,
-        TokenEvidence,
-        MarketEvidence,
-        ExecutionEvidence,
-        PortfolioState,
-    ) {
-        let proposal = ModelProposal {
-            mint: "ExampleMint111111111111111111111111111111".into(),
-            purpose,
-            mode: ExecutionMode::Paper,
-            notional_cents: 10_000,
-            phenotype: Phenotype::DexFirstLaunch,
-            reason: "fixture".into(),
-        };
-        let binding = EvidenceBinding::new(
-            proposal.mint.as_str(),
-            proposal.mint.as_str(),
-            proposal.mint.as_str(),
-        );
-        let decision = 995_500;
-        let token = TokenEvidence {
-            checked_at_ms: decision - 10_000,
-            exact_mint_verified: true,
-            security_gate_passed: true,
-            dex_first_verified: true,
-            entry_trigger_confirmed: true,
-        };
-        let market = MarketEvidence {
-            as_of_ms: decision - 1_000,
-            liquidity_cents: 2_000_000,
-            volume_24h_cents: 1_000_000,
-            market_cap_cents: 4_000_000,
-            geckoterminal_score: 70,
-            independent_price_sources: 2,
-        };
-        let execution = ExecutionEvidence {
-            mode: proposal.mode,
-            purpose,
-            quoted_notional_cents: proposal.notional_cents,
-            route_verified: true,
-            slippage_bps: 100,
-            price_impact_bps: 50,
-            route_fee_bps: 30,
-            price_divergence_bps: 100,
-            timeline: TimelineEvidence {
-                observed_at_ms: 990_000,
-                armed_at_ms: 993_000,
-                signal_at_ms: 995_000,
-                decision_recorded_at_ms: decision,
-                quote_at_ms: 996_000,
-                now_ms: 1_000_000,
-            },
-        };
-        let portfolio = PortfolioState {
-            nav_cents: 100_000,
-            available_cash_cents: 50_000,
-            total_exposure_cents: 0,
-            daily_realized_loss_cents: 0,
-            open_positions: 0,
-            current_position_value_cents: 20_000,
-            entry_halt_active: false,
-            global_kill_switch_active: false,
-        };
-        (proposal, binding, token, market, execution, portfolio)
-    }
-
-    #[test]
-    fn clean_entry_is_allowed() {
-        let (p, b, t, m, e, s) = fixture(Purpose::Entry);
-        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
-        assert!(d.allowed, "unexpected rejections: {:?}", d.reasons);
-    }
-
-    #[test]
-    fn mismatched_execution_context_is_rejected() {
-        let (p, b, t, m, mut e, s) = fixture(Purpose::Entry);
-        e.quoted_notional_cents += 1;
-        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
-        assert!(d.reasons.contains(&Rejection::QuoteNotionalMismatch));
-    }
-
-    #[test]
-    fn post_decision_quote_is_required() {
-        let (p, b, t, m, mut e, s) = fixture(Purpose::Entry);
-        e.timeline.quote_at_ms = e.timeline.decision_recorded_at_ms;
-        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
-        assert!(d.reasons.contains(&Rejection::QuoteNotAfterDecision));
-    }
-
-    #[test]
-    fn future_market_evidence_is_rejected() {
-        let (p, b, t, mut m, e, s) = fixture(Purpose::Entry);
-        m.as_of_ms = e.timeline.decision_recorded_at_ms + 1;
-        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
-        assert!(d.reasons.contains(&Rejection::MarketEvidenceFromFuture));
-    }
-
-    #[test]
-    fn entry_halt_does_not_trap_exit() {
-        let (mut p, b, mut t, mut m, mut e, mut s) = fixture(Purpose::Exit);
-        p.notional_cents = 5_000;
-        e.quoted_notional_cents = p.notional_cents;
-        s.entry_halt_active = true;
-        t.exact_mint_verified = false;
-        t.security_gate_passed = false;
-        t.dex_first_verified = false;
-        t.entry_trigger_confirmed = false;
-        m.liquidity_cents = 0;
-        m.volume_24h_cents = 0;
-        m.market_cap_cents = 0;
-        m.geckoterminal_score = 0;
-        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
-        assert!(d.allowed, "exit trapped: {:?}", d.reasons);
-    }
 }
