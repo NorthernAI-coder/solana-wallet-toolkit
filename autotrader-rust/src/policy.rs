@@ -95,13 +95,16 @@ pub struct RiskConfig {
     pub emergency_exit_max_slippage_bps: u32,
     pub emergency_exit_max_price_impact_bps: u32,
     pub max_route_fee_bps: u32,
+    pub emergency_exit_max_route_fee_bps: u32,
     pub max_price_divergence_bps: u32,
+    pub emergency_exit_max_price_divergence_bps: u32,
     pub min_liquidity_cents: u64,
     pub min_volume_24h_cents: u64,
     pub max_market_cap_cents: u64,
     pub min_volume_to_market_cap_bps: u32,
     pub min_geckoterminal_score: u8,
     pub min_independent_price_sources: u8,
+    pub emergency_exit_min_independent_price_sources: u8,
     pub max_quote_age_ms: u64,
     pub max_open_positions: u16,
 }
@@ -117,13 +120,16 @@ impl Default for RiskConfig {
             emergency_exit_max_slippage_bps: 1_500,
             emergency_exit_max_price_impact_bps: 1_200,
             max_route_fee_bps: 500,
+            emergency_exit_max_route_fee_bps: 1_000,
             max_price_divergence_bps: 500,
+            emergency_exit_max_price_divergence_bps: 2_000,
             min_liquidity_cents: 1_000_000,
             min_volume_24h_cents: 500_000,
             max_market_cap_cents: 30_000_000,
             min_volume_to_market_cap_bps: 2_000,
             min_geckoterminal_score: 56,
             min_independent_price_sources: 2,
+            emergency_exit_min_independent_price_sources: 1,
             max_quote_age_ms: 15_000,
             max_open_positions: 5,
         }
@@ -235,6 +241,7 @@ impl PolicyEngine {
         reasons: &mut Vec<Rejection>,
     ) {
         let t = execution.timeline;
+        let emergency = proposal.purpose == Purpose::EmergencyExit;
 
         if !execution.route_verified {
             reasons.push(Rejection::RouteUnverified);
@@ -265,15 +272,30 @@ impl PolicyEngine {
             reasons.push(Rejection::InvalidSignalOrder);
         }
 
-        if execution.price_divergence_bps > self.config.max_price_divergence_bps {
+        let divergence_cap = if emergency {
+            self.config.emergency_exit_max_price_divergence_bps
+        } else {
+            self.config.max_price_divergence_bps
+        };
+        if execution.price_divergence_bps > divergence_cap {
             reasons.push(Rejection::PriceSourceDivergence);
         }
 
-        if market.independent_price_sources < self.config.min_independent_price_sources {
+        let required_sources = if emergency {
+            self.config.emergency_exit_min_independent_price_sources
+        } else {
+            self.config.min_independent_price_sources
+        };
+        if market.independent_price_sources < required_sources {
             reasons.push(Rejection::TooFewIndependentPriceSources);
         }
 
-        if execution.route_fee_bps > self.config.max_route_fee_bps {
+        let fee_cap = if emergency {
+            self.config.emergency_exit_max_route_fee_bps
+        } else {
+            self.config.max_route_fee_bps
+        };
+        if execution.route_fee_bps > fee_cap {
             reasons.push(Rejection::RouteFeeTooHigh);
         }
     }
@@ -505,11 +527,18 @@ mod tests {
     }
 
     #[test]
-    fn emergency_exit_has_separate_slippage_budget() {
-        let (p, t, m, mut e, s) = valid_fixture(Purpose::EmergencyExit);
+    fn emergency_exit_relaxes_data_confidence_but_not_route_freshness() {
+        let (p, t, mut m, mut e, s) = valid_fixture(Purpose::EmergencyExit);
+        m.independent_price_sources = 1;
         e.slippage_bps = 1_000;
         e.price_impact_bps = 900;
+        e.route_fee_bps = 800;
+        e.price_divergence_bps = 1_500;
         let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &t, &m, &e, &s);
         assert!(d.allowed, "emergency exit unexpectedly blocked: {:?}", d.reasons);
+
+        e.timeline.quote_at_ms = e.timeline.signal_at_ms;
+        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &t, &m, &e, &s);
+        assert!(d.reasons.contains(&Rejection::QuoteNotAfterSignal));
     }
 }
