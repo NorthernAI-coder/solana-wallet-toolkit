@@ -83,14 +83,7 @@ pub fn run_adversarial_simulation(iterations: u64) -> SimulationReport {
             valid_entry_fixture(&mut rng, i);
         report.valid_entry_checks += 1;
         if !engine
-            .evaluate(
-                &proposal,
-                &binding,
-                &token,
-                &market,
-                &execution,
-                &portfolio,
-            )
+            .evaluate(&proposal, &binding, &token, &market, &execution, &portfolio)
             .allowed
         {
             report.false_rejects += 1;
@@ -129,8 +122,7 @@ pub fn run_adversarial_simulation(iterations: u64) -> SimulationReport {
 
         let mut stale_emergency = em_e;
         stale_emergency.timeline.quote_at_ms = stale_emergency.timeline.decision_recorded_at_ms;
-        let stale_report =
-            engine.evaluate(&em_p, &em_b, &em_t, &em_m, &stale_emergency, &em_s);
+        let stale_report = engine.evaluate(&em_p, &em_b, &em_t, &em_m, &stale_emergency, &em_s);
         if stale_report.allowed {
             report.false_accepts += 1;
         } else if stale_report
@@ -356,16 +348,14 @@ fn mutate_entry_to_fail(
         41 => e.slippage_bps = c.max_slippage_bps.saturating_add(1),
         42 => e.price_impact_bps = c.max_price_impact_bps.saturating_add(1),
         43 => e.route_fee_bps = c.max_route_fee_bps.saturating_add(1),
-        44 => {
-            s.daily_realized_loss_cents =
-                s.risk_reference_nav_cents.saturating_mul(5) / 100
-        }
+        44 => s.daily_realized_loss_cents = s.risk_reference_nav_cents.saturating_mul(5) / 100,
         45 => {
             s.current_position_mint = None;
             s.current_position_value_cents = 0;
             s.total_exposure_cents = 0;
             s.available_cash_cents = s.nav_cents;
-            p.notional_cents = pct_for_sim(s.nav_cents, c.max_position_bps_of_nav).saturating_add(1);
+            p.notional_cents =
+                pct_for_sim(s.nav_cents, c.max_position_bps_of_nav).saturating_add(1);
             e.quoted_notional_cents = p.notional_cents;
         }
         46 => {
