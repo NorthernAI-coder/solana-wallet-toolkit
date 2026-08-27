@@ -21,48 +21,61 @@ fn fixture(purpose: Purpose) -> Fixture {
         phenotype: Phenotype::DexFirstLaunch,
         reason: "boundary test".into(),
     };
-    let binding = EvidenceBinding::new(&proposal.mint, &proposal.mint, &proposal.mint);
-    (
-        proposal,
-        binding,
-        TokenEvidence {
-            exact_mint_verified: true,
-            security_gate_passed: true,
-            dex_first_verified: true,
-            entry_trigger_confirmed: true,
+    let binding = EvidenceBinding::new(
+        proposal.mint.as_str(),
+        proposal.mint.as_str(),
+        proposal.mint.as_str(),
+    );
+    let decision = 3_500;
+    let token = TokenEvidence {
+        checked_at_ms: 3_000,
+        exact_mint_verified: true,
+        security_gate_passed: true,
+        dex_first_verified: true,
+        entry_trigger_confirmed: true,
+    };
+    let market = MarketEvidence {
+        as_of_ms: 3_000,
+        liquidity_cents: 1_000_000,
+        volume_24h_cents: 6_000_000,
+        market_cap_cents: 30_000_000,
+        geckoterminal_score: 56,
+        independent_price_sources: 2,
+    };
+    let execution = ExecutionEvidence {
+        mode: proposal.mode,
+        purpose: proposal.purpose,
+        quoted_notional_cents: proposal.notional_cents,
+        route_verified: true,
+        slippage_bps: 300,
+        price_impact_bps: 200,
+        route_fee_bps: 500,
+        price_divergence_bps: 500,
+        timeline: TimelineEvidence {
+            observed_at_ms: 1_000,
+            armed_at_ms: 2_000,
+            signal_at_ms: 3_000,
+            decision_recorded_at_ms: decision,
+            quote_at_ms: 4_000,
+            now_ms: 19_000,
         },
-        MarketEvidence {
-            liquidity_cents: 1_000_000,
-            volume_24h_cents: 6_000_000,
-            market_cap_cents: 30_000_000,
-            geckoterminal_score: 56,
-            independent_price_sources: 2,
-        },
-        ExecutionEvidence {
-            route_verified: true,
-            slippage_bps: 300,
-            price_impact_bps: 200,
-            route_fee_bps: 500,
-            price_divergence_bps: 500,
-            timeline: TimelineEvidence {
-                observed_at_ms: 1_000,
-                armed_at_ms: 2_000,
-                signal_at_ms: 3_000,
-                quote_at_ms: 3_001,
-                now_ms: 18_001,
-            },
-        },
-        PortfolioState {
-            nav_cents: 100_000,
-            available_cash_cents: 70_000,
-            total_exposure_cents: 30_000,
-            daily_realized_loss_cents: 4_999,
-            open_positions: 4,
-            current_position_value_cents: 20_000,
-            entry_halt_active: false,
-            global_kill_switch_active: false,
-        },
-    )
+    };
+    let portfolio = PortfolioState {
+        nav_cents: 100_000,
+        available_cash_cents: 70_000,
+        total_exposure_cents: 30_000,
+        daily_realized_loss_cents: 4_999,
+        open_positions: 4,
+        current_position_value_cents: 20_000,
+        entry_halt_active: false,
+        global_kill_switch_active: false,
+    };
+    (proposal, binding, token, market, execution, portfolio)
+}
+
+fn set_notional(proposal: &mut ModelProposal, execution: &mut ExecutionEvidence, cents: u64) {
+    proposal.notional_cents = cents;
+    execution.quoted_notional_cents = cents;
 }
 
 #[test]
@@ -81,9 +94,29 @@ fn evidence_for_another_mint_is_denied() {
 }
 
 #[test]
+fn execution_mode_direction_and_amount_are_bound_to_proposal() {
+    let (p, b, t, m, mut e, s) = fixture(Purpose::Entry);
+    let engine = PolicyEngine::new(RiskConfig::default());
+
+    e.mode = ExecutionMode::Shadow;
+    let r = engine.evaluate(&p, &b, &t, &m, &e, &s);
+    assert!(r.reasons.contains(&Rejection::ExecutionModeMismatch));
+
+    e.mode = p.mode;
+    e.purpose = Purpose::Exit;
+    let r = engine.evaluate(&p, &b, &t, &m, &e, &s);
+    assert!(r.reasons.contains(&Rejection::ExecutionPurposeMismatch));
+
+    e.purpose = p.purpose;
+    e.quoted_notional_cents = p.notional_cents + 1;
+    let r = engine.evaluate(&p, &b, &t, &m, &e, &s);
+    assert!(r.reasons.contains(&Rejection::QuoteNotionalMismatch));
+}
+
+#[test]
 fn position_one_cent_over_cap_is_denied() {
-    let (mut p, b, t, m, e, s) = fixture(Purpose::Entry);
-    p.notional_cents = 10_001;
+    let (mut p, b, t, m, mut e, s) = fixture(Purpose::Entry);
+    set_notional(&mut p, &mut e, 10_001);
     let r = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
     assert!(r.reasons.contains(&Rejection::PositionSizeTooLarge));
 }
@@ -139,11 +172,46 @@ fn volume_market_cap_exactly_twenty_percent_is_allowed() {
 }
 
 #[test]
-fn quote_age_boundary_is_strict() {
+fn post_decision_quote_and_quote_age_are_strict() {
     let (p, b, t, m, mut e, s) = fixture(Purpose::Entry);
-    e.timeline.now_ms = e.timeline.quote_at_ms + 15_001;
-    let r = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
+    let engine = PolicyEngine::new(RiskConfig::default());
+
+    e.timeline.quote_at_ms = e.timeline.decision_recorded_at_ms;
+    let r = engine.evaluate(&p, &b, &t, &m, &e, &s);
+    assert!(r.reasons.contains(&Rejection::QuoteNotAfterDecision));
+
+    e.timeline.quote_at_ms = 4_000;
+    e.timeline.now_ms = 19_001;
+    let r = engine.evaluate(&p, &b, &t, &m, &e, &s);
     assert!(r.reasons.contains(&Rejection::QuoteStale));
+}
+
+#[test]
+fn future_and_stale_market_evidence_are_denied() {
+    let (p, b, t, mut m, e, s) = fixture(Purpose::Entry);
+    let engine = PolicyEngine::new(RiskConfig::default());
+
+    m.as_of_ms = e.timeline.decision_recorded_at_ms + 1;
+    let r = engine.evaluate(&p, &b, &t, &m, &e, &s);
+    assert!(r.reasons.contains(&Rejection::MarketEvidenceFromFuture));
+
+    m.as_of_ms = e.timeline.decision_recorded_at_ms - 60_001;
+    let r = engine.evaluate(&p, &b, &t, &m, &e, &s);
+    assert!(r.reasons.contains(&Rejection::MarketEvidenceStale));
+}
+
+#[test]
+fn future_and_stale_token_evidence_are_denied_for_entries() {
+    let (p, b, mut t, m, e, s) = fixture(Purpose::Entry);
+    let engine = PolicyEngine::new(RiskConfig::default());
+
+    t.checked_at_ms = e.timeline.decision_recorded_at_ms + 1;
+    let r = engine.evaluate(&p, &b, &t, &m, &e, &s);
+    assert!(r.reasons.contains(&Rejection::TokenEvidenceFromFuture));
+
+    t.checked_at_ms = e.timeline.decision_recorded_at_ms.saturating_sub(300_001);
+    let r = engine.evaluate(&p, &b, &t, &m, &e, &s);
+    assert!(r.reasons.contains(&Rejection::TokenEvidenceStale));
 }
 
 #[test]
@@ -161,8 +229,8 @@ fn max_open_positions_blocks_entry_but_not_exit() {
     let r = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
     assert!(r.reasons.contains(&Rejection::OpenPositionLimitReached));
 
-    let (mut p, b, mut t, mut m, e, mut s) = fixture(Purpose::Exit);
-    p.notional_cents = 5_000;
+    let (mut p, b, mut t, mut m, mut e, mut s) = fixture(Purpose::Exit);
+    set_notional(&mut p, &mut e, 5_000);
     s.open_positions = 5;
     s.available_cash_cents = 0;
     s.entry_halt_active = true;
@@ -176,14 +244,18 @@ fn max_open_positions_blocks_entry_but_not_exit() {
     m.market_cap_cents = 0;
     m.geckoterminal_score = 0;
     let r = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
-    assert!(r.allowed, "exit trapped by entry risk gates: {:?}", r.reasons);
+    assert!(
+        r.allowed,
+        "exit trapped by entry risk gates: {:?}",
+        r.reasons
+    );
 }
 
 #[test]
 fn exit_cannot_claim_more_than_current_position() {
-    let (mut p, b, t, m, e, mut s) = fixture(Purpose::Exit);
+    let (mut p, b, t, m, mut e, mut s) = fixture(Purpose::Exit);
     s.current_position_value_cents = 5_000;
-    p.notional_cents = 5_001;
+    set_notional(&mut p, &mut e, 5_001);
     let r = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
     assert!(r.reasons.contains(&Rejection::ExitAmountExceedsPosition));
 }
@@ -191,9 +263,9 @@ fn exit_cannot_claim_more_than_current_position() {
 #[test]
 fn global_kill_switch_blocks_every_purpose() {
     for purpose in [Purpose::Entry, Purpose::Exit, Purpose::EmergencyExit] {
-        let (mut p, b, t, m, e, mut s) = fixture(purpose);
+        let (mut p, b, t, m, mut e, mut s) = fixture(purpose);
         if purpose != Purpose::Entry {
-            p.notional_cents = 5_000;
+            set_notional(&mut p, &mut e, 5_000);
         }
         s.global_kill_switch_active = true;
         let r = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
@@ -204,7 +276,7 @@ fn global_kill_switch_blocks_every_purpose() {
 #[test]
 fn emergency_exit_accepts_distressed_data_but_not_bad_route() {
     let (mut p, b, mut t, mut m, mut e, mut s) = fixture(Purpose::EmergencyExit);
-    p.notional_cents = 5_000;
+    set_notional(&mut p, &mut e, 5_000);
     s.available_cash_cents = 0;
     s.entry_halt_active = true;
     s.daily_realized_loss_cents = 100_000;
@@ -224,7 +296,11 @@ fn emergency_exit_accepts_distressed_data_but_not_bad_route() {
 
     let engine = PolicyEngine::new(RiskConfig::default());
     let r = engine.evaluate(&p, &b, &t, &m, &e, &s);
-    assert!(r.allowed, "distressed emergency exit rejected: {:?}", r.reasons);
+    assert!(
+        r.allowed,
+        "distressed emergency exit rejected: {:?}",
+        r.reasons
+    );
 
     e.route_verified = false;
     let r = engine.evaluate(&p, &b, &t, &m, &e, &s);
@@ -233,11 +309,11 @@ fn emergency_exit_accepts_distressed_data_but_not_bad_route() {
 
 #[test]
 fn u64_exposure_overflow_is_detected() {
-    let (mut p, b, t, m, e, mut s) = fixture(Purpose::Entry);
+    let (mut p, b, t, m, mut e, mut s) = fixture(Purpose::Entry);
     s.nav_cents = u64::MAX;
     s.available_cash_cents = u64::MAX;
     s.total_exposure_cents = u64::MAX - 5;
-    p.notional_cents = 10;
+    set_notional(&mut p, &mut e, 10);
     let r = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
     assert!(r.reasons.contains(&Rejection::ArithmeticOverflow));
 }
