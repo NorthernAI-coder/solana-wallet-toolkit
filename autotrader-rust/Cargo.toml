@@ -2,13 +2,9 @@
 name = "autotrader-fortress"
 version = "0.1.0"
 edition = "2021"
-description = "Deterministic risk firewall and adversarial simulator for an autonomous Solana trading agent"
+description = "Deterministic risk firewall and adversarial simulator for a Solana paper/shadow trading agent"
 license = "MIT"
 publish = false
-
-[features]
-default = []
-live-trading = []
 
 [dependencies]
 
