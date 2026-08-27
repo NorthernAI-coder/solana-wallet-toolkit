@@ -36,8 +36,8 @@ pub struct ModelProposal {
     pub reason: String,
 }
 
-/// Binds independently collected evidence to the exact asset named by the model proposal.
-/// All three values must equal `ModelProposal::mint` before any other policy decision can pass.
+/// Exact asset identities reported independently by token, market, and execution adapters.
+/// Do not construct these values by copying `ModelProposal::mint` without source verification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EvidenceBinding {
     pub token_evidence_mint: String,
@@ -46,11 +46,15 @@ pub struct EvidenceBinding {
 }
 
 impl EvidenceBinding {
-    pub fn for_mint(mint: &str) -> Self {
+    pub fn new(
+        token_evidence_mint: impl Into<String>,
+        market_evidence_mint: impl Into<String>,
+        execution_evidence_mint: impl Into<String>,
+    ) -> Self {
         Self {
-            token_evidence_mint: mint.to_owned(),
-            market_evidence_mint: mint.to_owned(),
-            execution_evidence_mint: mint.to_owned(),
+            token_evidence_mint: token_evidence_mint.into(),
+            market_evidence_mint: market_evidence_mint.into(),
+            execution_evidence_mint: execution_evidence_mint.into(),
         }
     }
 
@@ -101,6 +105,7 @@ pub struct ExecutionEvidence {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortfolioState {
     pub nav_cents: u64,
+    pub available_cash_cents: u64,
     pub total_exposure_cents: u64,
     pub daily_realized_loss_cents: u64,
     pub open_positions: u16,
@@ -190,6 +195,7 @@ pub enum Rejection {
     DailyLossLimitReached,
     PositionSizeInvalid,
     PositionSizeTooLarge,
+    InsufficientCash,
     TotalExposureTooHigh,
     OpenPositionLimitReached,
     ExitAmountInvalid,
@@ -240,7 +246,6 @@ impl PolicyEngine {
         if !binding.matches(&proposal.mint) {
             reasons.push(Rejection::EvidenceMintMismatch);
         }
-
         if portfolio.global_kill_switch_active {
             reasons.push(Rejection::GlobalKillSwitch);
         }
@@ -390,6 +395,9 @@ impl PolicyEngine {
         if proposal.notional_cents > max_position {
             reasons.push(Rejection::PositionSizeTooLarge);
         }
+        if proposal.notional_cents > portfolio.available_cash_cents {
+            reasons.push(Rejection::InsufficientCash);
+        }
 
         let max_total_exposure =
             pct_of(portfolio.nav_cents, self.config.max_total_exposure_bps_of_nav);
@@ -473,7 +481,7 @@ mod tests {
             phenotype: Phenotype::DexFirstLaunch,
             reason: "fixture".into(),
         };
-        let binding = EvidenceBinding::for_mint(&proposal.mint);
+        let binding = EvidenceBinding::new(&proposal.mint, &proposal.mint, &proposal.mint);
         let token = TokenEvidence {
             exact_mint_verified: true,
             security_gate_passed: true,
@@ -503,6 +511,7 @@ mod tests {
         };
         let portfolio = PortfolioState {
             nav_cents: 100_000,
+            available_cash_cents: 50_000,
             total_exposure_cents: 0,
             daily_realized_loss_cents: 0,
             open_positions: 0,
@@ -526,6 +535,14 @@ mod tests {
         b.market_evidence_mint = "DifferentMint11111111111111111111111111111".into();
         let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
         assert!(d.reasons.contains(&Rejection::EvidenceMintMismatch));
+    }
+
+    #[test]
+    fn insufficient_cash_is_rejected() {
+        let (p, b, t, m, e, mut s) = fixture(Purpose::Entry);
+        s.available_cash_cents = p.notional_cents - 1;
+        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
+        assert!(d.reasons.contains(&Rejection::InsufficientCash));
     }
 
     #[test]
