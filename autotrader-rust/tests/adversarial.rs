@@ -21,7 +21,7 @@ fn fixture(purpose: Purpose) -> Fixture {
         phenotype: Phenotype::DexFirstLaunch,
         reason: "boundary test".into(),
     };
-    let binding = EvidenceBinding::for_mint(&proposal.mint);
+    let binding = EvidenceBinding::new(&proposal.mint, &proposal.mint, &proposal.mint);
     (
         proposal,
         binding,
@@ -54,6 +54,7 @@ fn fixture(purpose: Purpose) -> Fixture {
         },
         PortfolioState {
             nav_cents: 100_000,
+            available_cash_cents: 70_000,
             total_exposure_cents: 30_000,
             daily_realized_loss_cents: 4_999,
             open_positions: 4,
@@ -93,6 +94,14 @@ fn projected_exposure_one_cent_over_cap_is_denied() {
     s.total_exposure_cents = 30_001;
     let r = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
     assert!(r.reasons.contains(&Rejection::TotalExposureTooHigh));
+}
+
+#[test]
+fn insufficient_cash_is_denied_even_if_exposure_cap_allows_trade() {
+    let (p, b, t, m, e, mut s) = fixture(Purpose::Entry);
+    s.available_cash_cents = p.notional_cents - 1;
+    let r = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
+    assert!(r.reasons.contains(&Rejection::InsufficientCash));
 }
 
 #[test]
@@ -155,6 +164,7 @@ fn max_open_positions_blocks_entry_but_not_exit() {
     let (mut p, b, mut t, mut m, e, mut s) = fixture(Purpose::Exit);
     p.notional_cents = 5_000;
     s.open_positions = 5;
+    s.available_cash_cents = 0;
     s.entry_halt_active = true;
     s.daily_realized_loss_cents = 100_000;
     t.exact_mint_verified = false;
@@ -195,6 +205,7 @@ fn global_kill_switch_blocks_every_purpose() {
 fn emergency_exit_accepts_distressed_data_but_not_bad_route() {
     let (mut p, b, mut t, mut m, mut e, mut s) = fixture(Purpose::EmergencyExit);
     p.notional_cents = 5_000;
+    s.available_cash_cents = 0;
     s.entry_halt_active = true;
     s.daily_realized_loss_cents = 100_000;
     t.exact_mint_verified = false;
@@ -224,6 +235,7 @@ fn emergency_exit_accepts_distressed_data_but_not_bad_route() {
 fn u64_exposure_overflow_is_detected() {
     let (mut p, b, t, m, e, mut s) = fixture(Purpose::Entry);
     s.nav_cents = u64::MAX;
+    s.available_cash_cents = u64::MAX;
     s.total_exposure_cents = u64::MAX - 5;
     p.notional_cents = 10;
     let r = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
