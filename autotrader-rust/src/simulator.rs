@@ -337,7 +337,7 @@ fn valid_exit_fixture(rng: &mut Lcg, i: u64, emergency: bool) -> Fixture {
     let proposal = ModelProposal {
         mint: format!("ExitMint{i:019}"),
         purpose,
-        mode: if i % 2 == 0 {
+        mode: if i.is_multiple_of(2) {
             ExecutionMode::Paper
         } else {
             ExecutionMode::Shadow
