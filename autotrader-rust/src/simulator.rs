@@ -1,6 +1,6 @@
 use crate::policy::{
-    ExecutionEvidence, ExecutionMode, MarketEvidence, ModelProposal, Phenotype, PolicyEngine,
-    PortfolioState, Purpose, Rejection, RiskConfig, TimelineEvidence, TokenEvidence,
+    EvidenceBinding, ExecutionEvidence, ExecutionMode, MarketEvidence, ModelProposal, Phenotype,
+    PolicyEngine, PortfolioState, Purpose, Rejection, RiskConfig, TimelineEvidence, TokenEvidence,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -56,6 +56,15 @@ impl Lcg {
     }
 }
 
+type Fixture = (
+    ModelProposal,
+    EvidenceBinding,
+    TokenEvidence,
+    MarketEvidence,
+    ExecutionEvidence,
+    PortfolioState,
+);
+
 pub fn run_adversarial_simulation(iterations: u64) -> SimulationReport {
     let engine = PolicyEngine::new(RiskConfig::default());
     let mut rng = Lcg::new(0xF07E_55A5_D15C_A11E);
@@ -65,21 +74,28 @@ pub fn run_adversarial_simulation(iterations: u64) -> SimulationReport {
     };
 
     for i in 0..iterations {
-        let (proposal, token, market, execution, portfolio) = valid_entry_fixture(&mut rng, i);
+        let (proposal, binding, token, market, execution, portfolio) = valid_entry_fixture(&mut rng, i);
 
         report.valid_entry_checks += 1;
         if !engine
-            .evaluate(&proposal, &token, &market, &execution, &portfolio)
+            .evaluate(
+                &proposal,
+                &binding,
+                &token,
+                &market,
+                &execution,
+                &portfolio,
+            )
             .allowed
         {
             report.false_rejects += 1;
         }
 
-        let mutation_count = 22u64;
-        let mutation = rng.next_u64() % mutation_count;
-        let (bad_p, bad_t, bad_m, bad_e, bad_s) = mutate_entry_to_fail(
+        let mutation = rng.next_u64() % 30;
+        let (bad_p, bad_b, bad_t, bad_m, bad_e, bad_s) = mutate_entry_to_fail(
             mutation,
-            proposal.clone(),
+            proposal,
+            binding,
             token,
             market,
             execution,
@@ -88,32 +104,41 @@ pub fn run_adversarial_simulation(iterations: u64) -> SimulationReport {
         );
         report.invalid_entry_checks += 1;
         if engine
-            .evaluate(&bad_p, &bad_t, &bad_m, &bad_e, &bad_s)
+            .evaluate(&bad_p, &bad_b, &bad_t, &bad_m, &bad_e, &bad_s)
             .allowed
         {
             report.false_accepts += 1;
         }
 
-        let (exit_p, exit_t, exit_m, exit_e, exit_s) = valid_exit_fixture(&mut rng, i, false);
+        let (exit_p, exit_b, exit_t, exit_m, exit_e, exit_s) =
+            valid_exit_fixture(&mut rng, i, false);
         report.valid_exit_checks += 1;
         if !engine
-            .evaluate(&exit_p, &exit_t, &exit_m, &exit_e, &exit_s)
+            .evaluate(&exit_p, &exit_b, &exit_t, &exit_m, &exit_e, &exit_s)
             .allowed
         {
             report.false_rejects += 1;
         }
 
-        let (em_p, em_t, em_m, em_e, em_s) = valid_exit_fixture(&mut rng, i, true);
+        let (em_p, em_b, em_t, em_m, em_e, em_s) = valid_exit_fixture(&mut rng, i, true);
         report.emergency_exit_checks += 1;
-        if !engine.evaluate(&em_p, &em_t, &em_m, &em_e, &em_s).allowed {
+        if !engine
+            .evaluate(&em_p, &em_b, &em_t, &em_m, &em_e, &em_s)
+            .allowed
+        {
             report.false_rejects += 1;
         }
 
-        // Emergency mode is intentionally permissive about distressed market data, but never
-        // about execution provenance. A stale/same-signal quote must still be caught.
         let mut stale_emergency = em_e;
         stale_emergency.timeline.quote_at_ms = stale_emergency.timeline.signal_at_ms;
-        let stale_report = engine.evaluate(&em_p, &em_t, &em_m, &stale_emergency, &em_s);
+        let stale_report = engine.evaluate(
+            &em_p,
+            &em_b,
+            &em_t,
+            &em_m,
+            &stale_emergency,
+            &em_s,
+        );
         if stale_report.allowed {
             report.false_accepts += 1;
         } else if stale_report.reasons.contains(&Rejection::QuoteNotAfterSignal) {
@@ -124,52 +149,45 @@ pub fn run_adversarial_simulation(iterations: u64) -> SimulationReport {
     report
 }
 
-fn valid_entry_fixture(
-    rng: &mut Lcg,
-    i: u64,
-) -> (
-    ModelProposal,
-    TokenEvidence,
-    MarketEvidence,
-    ExecutionEvidence,
-    PortfolioState,
-) {
+fn valid_entry_fixture(rng: &mut Lcg, i: u64) -> Fixture {
     let nav = rng.range_u64(100_000, 10_000_000);
     let max_position = nav / 10;
     let notional = rng.range_u64(1, max_position.max(1));
     let max_total = nav.saturating_mul(4) / 10;
-    let existing_exposure_cap = max_total.saturating_sub(notional);
-    let total_exposure = rng.range_u64(0, existing_exposure_cap);
+    let total_exposure = rng.range_u64(0, max_total.saturating_sub(notional));
     let market_cap = rng.range_u64(2_500_000, 30_000_000);
     let min_absorption = market_cap.saturating_mul(20) / 100;
     let volume = rng.range_u64(500_000.max(min_absorption), market_cap.max(500_000));
     let signal = 1_000_000u64.saturating_add(i.saturating_mul(100));
     let quote = signal.saturating_add(rng.range_u64(1, 5_000));
     let now = quote.saturating_add(rng.range_u64(0, 15_000));
+    let proposal = ModelProposal {
+        mint: format!("SimMint{i:020}"),
+        purpose: Purpose::Entry,
+        mode: match i % 3 {
+            0 => ExecutionMode::Paper,
+            1 => ExecutionMode::Shadow,
+            _ => ExecutionMode::Devnet,
+        },
+        notional_cents: notional,
+        phenotype: match i % 9 {
+            0 => Phenotype::Builder,
+            1 => Phenotype::Provenance,
+            2 => Phenotype::ControllerBehavior,
+            3 => Phenotype::GithubPreToken,
+            4 => Phenotype::PhoenixMigration,
+            5 => Phenotype::DexFirstLaunch,
+            6 => Phenotype::CreatorApprovedMeme,
+            7 => Phenotype::StructuralDemand,
+            _ => Phenotype::ResidualValue,
+        },
+        reason: "simulation fixture".into(),
+    };
+    let binding = EvidenceBinding::for_mint(&proposal.mint);
 
     (
-        ModelProposal {
-            mint: format!("SimMint{i:020}"),
-            purpose: Purpose::Entry,
-            mode: match i % 3 {
-                0 => ExecutionMode::Paper,
-                1 => ExecutionMode::Shadow,
-                _ => ExecutionMode::Devnet,
-            },
-            notional_cents: notional,
-            phenotype: match i % 9 {
-                0 => Phenotype::Builder,
-                1 => Phenotype::Provenance,
-                2 => Phenotype::ControllerBehavior,
-                3 => Phenotype::GithubPreToken,
-                4 => Phenotype::PhoenixMigration,
-                5 => Phenotype::DexFirstLaunch,
-                6 => Phenotype::CreatorApprovedMeme,
-                7 => Phenotype::StructuralDemand,
-                _ => Phenotype::ResidualValue,
-            },
-            reason: "simulation fixture".into(),
-        },
+        proposal,
+        binding,
         TokenEvidence {
             exact_mint_verified: true,
             security_gate_passed: true,
@@ -200,7 +218,10 @@ fn valid_entry_fixture(
         PortfolioState {
             nav_cents: nav,
             total_exposure_cents: total_exposure,
-            daily_realized_loss_cents: rng.range_u64(0, (nav.saturating_mul(5) / 100).saturating_sub(1)),
+            daily_realized_loss_cents: rng.range_u64(
+                0,
+                (nav.saturating_mul(5) / 100).saturating_sub(1),
+            ),
             open_positions: rng.range_u64(0, 4) as u16,
             current_position_value_cents: notional,
             entry_halt_active: false,
@@ -209,21 +230,17 @@ fn valid_entry_fixture(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mutate_entry_to_fail(
     mutation: u64,
     mut p: ModelProposal,
+    mut b: EvidenceBinding,
     mut t: TokenEvidence,
     mut m: MarketEvidence,
     mut e: ExecutionEvidence,
     mut s: PortfolioState,
     engine: &PolicyEngine,
-) -> (
-    ModelProposal,
-    TokenEvidence,
-    MarketEvidence,
-    ExecutionEvidence,
-    PortfolioState,
-) {
+) -> Fixture {
     let c = engine.config();
     match mutation {
         0 => s.global_kill_switch_active = true,
@@ -231,47 +248,48 @@ fn mutate_entry_to_fail(
         2 => e.route_verified = false,
         3 => e.timeline.quote_at_ms = e.timeline.signal_at_ms,
         4 => e.timeline.quote_at_ms = e.timeline.now_ms.saturating_add(1),
-        5 => e.timeline.now_ms = e
-            .timeline
-            .quote_at_ms
-            .saturating_add(c.max_quote_age_ms)
-            .saturating_add(1),
+        5 => {
+            e.timeline.now_ms = e
+                .timeline
+                .quote_at_ms
+                .saturating_add(c.max_quote_age_ms)
+                .saturating_add(1)
+        }
         6 => e.timeline.armed_at_ms = e.timeline.signal_at_ms.saturating_add(1),
         7 => e.price_divergence_bps = c.max_price_divergence_bps.saturating_add(1),
         8 => m.independent_price_sources = c.min_independent_price_sources.saturating_sub(1),
-        9 => t.exact_mint_verified = false,
-        10 => t.security_gate_passed = false,
-        11 => t.dex_first_verified = false,
-        12 => t.entry_trigger_confirmed = false,
-        13 => m.liquidity_cents = c.min_liquidity_cents.saturating_sub(1),
-        14 => m.volume_24h_cents = c.min_volume_24h_cents.saturating_sub(1),
-        15 => m.market_cap_cents = c.max_market_cap_cents.saturating_add(1),
-        16 => {
+        9 => b.token_evidence_mint.push('X'),
+        10 => b.market_evidence_mint.push('X'),
+        11 => b.execution_evidence_mint.push('X'),
+        12 => t.exact_mint_verified = false,
+        13 => t.security_gate_passed = false,
+        14 => t.dex_first_verified = false,
+        15 => t.entry_trigger_confirmed = false,
+        16 => m.liquidity_cents = c.min_liquidity_cents.saturating_sub(1),
+        17 => m.volume_24h_cents = c.min_volume_24h_cents.saturating_sub(1),
+        18 => m.market_cap_cents = 0,
+        19 => m.market_cap_cents = c.max_market_cap_cents.saturating_add(1),
+        20 => {
             m.market_cap_cents = c.max_market_cap_cents.max(10_000);
             m.volume_24h_cents = m.market_cap_cents.saturating_mul(19) / 100;
         }
-        17 => m.geckoterminal_score = c.min_geckoterminal_score.saturating_sub(1),
-        18 => e.slippage_bps = c.max_slippage_bps.saturating_add(1),
-        19 => e.price_impact_bps = c.max_price_impact_bps.saturating_add(1),
-        20 => e.route_fee_bps = c.max_route_fee_bps.saturating_add(1),
-        _ => {
-            p.notional_cents = (s.nav_cents / 10).saturating_add(1);
+        21 => m.geckoterminal_score = c.min_geckoterminal_score.saturating_sub(1),
+        22 => e.slippage_bps = c.max_slippage_bps.saturating_add(1),
+        23 => e.price_impact_bps = c.max_price_impact_bps.saturating_add(1),
+        24 => e.route_fee_bps = c.max_route_fee_bps.saturating_add(1),
+        25 => s.daily_realized_loss_cents = s.nav_cents.saturating_mul(5) / 100,
+        26 => p.notional_cents = (s.nav_cents / 10).saturating_add(1),
+        27 => {
+            p.notional_cents = 1;
+            s.total_exposure_cents = s.nav_cents.saturating_mul(4) / 10;
         }
+        28 => s.open_positions = c.max_open_positions,
+        _ => p.notional_cents = 0,
     }
-    (p, t, m, e, s)
+    (p, b, t, m, e, s)
 }
 
-fn valid_exit_fixture(
-    rng: &mut Lcg,
-    i: u64,
-    emergency: bool,
-) -> (
-    ModelProposal,
-    TokenEvidence,
-    MarketEvidence,
-    ExecutionEvidence,
-    PortfolioState,
-) {
+fn valid_exit_fixture(rng: &mut Lcg, i: u64, emergency: bool) -> Fixture {
     let signal = 10_000_000u64.saturating_add(i.saturating_mul(100));
     let quote = signal.saturating_add(rng.range_u64(1, 2_000));
     let position = rng.range_u64(1_000, 100_000);
@@ -286,33 +304,34 @@ fn valid_exit_fixture(
     } else {
         (300, 200, 500, 500, 2)
     };
+    let proposal = ModelProposal {
+        mint: format!("ExitMint{i:019}"),
+        purpose,
+        mode: if i % 2 == 0 {
+            ExecutionMode::Paper
+        } else {
+            ExecutionMode::Shadow
+        },
+        notional_cents: amount,
+        phenotype: Phenotype::Other,
+        reason: if emergency {
+            "emergency risk reduction"
+        } else {
+            "risk reduction"
+        }
+        .into(),
+    };
+    let binding = EvidenceBinding::for_mint(&proposal.mint);
 
     (
-        ModelProposal {
-            mint: format!("ExitMint{i:019}"),
-            purpose,
-            mode: if i % 2 == 0 {
-                ExecutionMode::Paper
-            } else {
-                ExecutionMode::Shadow
-            },
-            notional_cents: amount,
-            phenotype: Phenotype::Other,
-            reason: if emergency {
-                "emergency risk reduction"
-            } else {
-                "risk reduction"
-            }
-            .into(),
-        },
-        // Deliberately fail every entry-only token gate. Exits must still be possible.
+        proposal,
+        binding,
         TokenEvidence {
             exact_mint_verified: false,
             security_gate_passed: false,
             dex_first_verified: false,
             entry_trigger_confirmed: false,
         },
-        // Deliberately distressed entry metrics; only execution evidence should govern exits.
         MarketEvidence {
             liquidity_cents: 0,
             volume_24h_cents: 0,
@@ -328,7 +347,7 @@ fn valid_exit_fixture(
             price_divergence_bps: rng.range_u32(0, divergence_cap),
             timeline: TimelineEvidence {
                 observed_at_ms: signal.saturating_sub(5_000),
-                armed_at_ms: signal.saturating_add(100), // ignored for exits by design
+                armed_at_ms: signal.saturating_add(100),
                 signal_at_ms: signal,
                 quote_at_ms: quote,
                 now_ms: quote.saturating_add(rng.range_u64(0, 15_000)),
@@ -337,7 +356,7 @@ fn valid_exit_fixture(
         PortfolioState {
             nav_cents: 100_000,
             total_exposure_cents: position,
-            daily_realized_loss_cents: 100_000, // entry-only risk stop must not trap exits
+            daily_realized_loss_cents: 100_000,
             open_positions: 5,
             current_position_value_cents: position,
             entry_halt_active: true,
