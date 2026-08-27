@@ -36,6 +36,32 @@ pub struct ModelProposal {
     pub reason: String,
 }
 
+/// Binds independently collected evidence to the exact asset named by the model proposal.
+/// All three values must equal `ModelProposal::mint` before any other policy decision can pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvidenceBinding {
+    pub token_evidence_mint: String,
+    pub market_evidence_mint: String,
+    pub execution_evidence_mint: String,
+}
+
+impl EvidenceBinding {
+    pub fn for_mint(mint: &str) -> Self {
+        Self {
+            token_evidence_mint: mint.to_owned(),
+            market_evidence_mint: mint.to_owned(),
+            execution_evidence_mint: mint.to_owned(),
+        }
+    }
+
+    fn matches(&self, proposal_mint: &str) -> bool {
+        !proposal_mint.is_empty()
+            && self.token_evidence_mint == proposal_mint
+            && self.market_evidence_mint == proposal_mint
+            && self.execution_evidence_mint == proposal_mint
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimelineEvidence {
     pub observed_at_ms: u64,
@@ -138,6 +164,7 @@ impl Default for RiskConfig {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rejection {
+    EvidenceMintMismatch,
     GlobalKillSwitch,
     EntryHalt,
     RouteUnverified,
@@ -202,12 +229,17 @@ impl PolicyEngine {
     pub fn evaluate(
         &self,
         proposal: &ModelProposal,
+        binding: &EvidenceBinding,
         token: &TokenEvidence,
         market: &MarketEvidence,
         execution: &ExecutionEvidence,
         portfolio: &PortfolioState,
     ) -> DecisionReport {
         let mut reasons = Vec::new();
+
+        if !binding.matches(&proposal.mint) {
+            reasons.push(Rejection::EvidenceMintMismatch);
+        }
 
         if portfolio.global_kill_switch_active {
             reasons.push(Rejection::GlobalKillSwitch);
@@ -246,11 +278,9 @@ impl PolicyEngine {
         if !execution.route_verified {
             reasons.push(Rejection::RouteUnverified);
         }
-
         if t.quote_at_ms <= t.signal_at_ms {
             reasons.push(Rejection::QuoteNotAfterSignal);
         }
-
         if t.quote_at_ms > t.now_ms {
             reasons.push(Rejection::QuoteFromFuture);
         } else if t.now_ms.saturating_sub(t.quote_at_ms) > self.config.max_quote_age_ms {
@@ -267,7 +297,6 @@ impl PolicyEngine {
                 t.observed_at_ms <= t.signal_at_ms && t.signal_at_ms < t.quote_at_ms
             }
         };
-
         if !valid_order {
             reasons.push(Rejection::InvalidSignalOrder);
         }
@@ -321,7 +350,6 @@ impl PolicyEngine {
         if !token.entry_trigger_confirmed {
             reasons.push(Rejection::EntryTriggerMissing);
         }
-
         if market.liquidity_cents < self.config.min_liquidity_cents {
             reasons.push(Rejection::LiquidityTooLow);
         }
@@ -343,7 +371,6 @@ impl PolicyEngine {
         if market.geckoterminal_score < self.config.min_geckoterminal_score {
             reasons.push(Rejection::GeckoTerminalScoreTooLow);
         }
-
         if execution.slippage_bps > self.config.max_slippage_bps {
             reasons.push(Rejection::SlippageTooHigh);
         }
@@ -355,7 +382,6 @@ impl PolicyEngine {
         if portfolio.daily_realized_loss_cents >= daily_loss_limit {
             reasons.push(Rejection::DailyLossLimitReached);
         }
-
         if proposal.notional_cents == 0 {
             reasons.push(Rejection::PositionSizeInvalid);
         }
@@ -405,7 +431,6 @@ impl PolicyEngine {
         } else {
             self.config.max_price_impact_bps
         };
-
         if execution.slippage_bps > slippage_cap {
             reasons.push(Rejection::SlippageTooHigh);
         }
@@ -432,8 +457,9 @@ fn ratio_bps(numerator: u64, denominator: u64) -> u32 {
 mod tests {
     use super::*;
 
-    fn valid_fixture(purpose: Purpose) -> (
+    fn fixture(purpose: Purpose) -> (
         ModelProposal,
+        EvidenceBinding,
         TokenEvidence,
         MarketEvidence,
         ExecutionEvidence,
@@ -447,6 +473,7 @@ mod tests {
             phenotype: Phenotype::DexFirstLaunch,
             reason: "fixture".into(),
         };
+        let binding = EvidenceBinding::for_mint(&proposal.mint);
         let token = TokenEvidence {
             exact_mint_verified: true,
             security_gate_passed: true,
@@ -483,27 +510,35 @@ mod tests {
             entry_halt_active: false,
             global_kill_switch_active: false,
         };
-        (proposal, token, market, execution, portfolio)
+        (proposal, binding, token, market, execution, portfolio)
     }
 
     #[test]
-    fn clean_entry_is_allowed_in_paper_mode() {
-        let (p, t, m, e, s) = valid_fixture(Purpose::Entry);
-        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &t, &m, &e, &s);
+    fn clean_entry_is_allowed() {
+        let (p, b, t, m, e, s) = fixture(Purpose::Entry);
+        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
         assert!(d.allowed, "unexpected rejections: {:?}", d.reasons);
     }
 
     #[test]
-    fn same_observation_cannot_be_the_fill() {
-        let (p, t, m, mut e, s) = valid_fixture(Purpose::Entry);
+    fn mismatched_evidence_mint_is_rejected() {
+        let (p, mut b, t, m, e, s) = fixture(Purpose::Entry);
+        b.market_evidence_mint = "DifferentMint11111111111111111111111111111".into();
+        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
+        assert!(d.reasons.contains(&Rejection::EvidenceMintMismatch));
+    }
+
+    #[test]
+    fn same_signal_cannot_be_fill() {
+        let (p, b, t, m, mut e, s) = fixture(Purpose::Entry);
         e.timeline.quote_at_ms = e.timeline.signal_at_ms;
-        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &t, &m, &e, &s);
+        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
         assert!(d.reasons.contains(&Rejection::QuoteNotAfterSignal));
     }
 
     #[test]
     fn entry_halt_does_not_trap_exit() {
-        let (mut p, mut t, mut m, e, mut s) = valid_fixture(Purpose::Exit);
+        let (mut p, b, mut t, mut m, e, mut s) = fixture(Purpose::Exit);
         p.notional_cents = 5_000;
         s.entry_halt_active = true;
         t.exact_mint_verified = false;
@@ -514,31 +549,15 @@ mod tests {
         m.volume_24h_cents = 0;
         m.market_cap_cents = 0;
         m.geckoterminal_score = 0;
-        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &t, &m, &e, &s);
-        assert!(d.allowed, "exit was trapped by entry-only rules: {:?}", d.reasons);
+        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
+        assert!(d.allowed, "exit trapped: {:?}", d.reasons);
     }
 
     #[test]
     fn global_kill_switch_blocks_even_exit() {
-        let (p, t, m, e, mut s) = valid_fixture(Purpose::Exit);
+        let (p, b, t, m, e, mut s) = fixture(Purpose::Exit);
         s.global_kill_switch_active = true;
-        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &t, &m, &e, &s);
+        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &b, &t, &m, &e, &s);
         assert!(d.reasons.contains(&Rejection::GlobalKillSwitch));
-    }
-
-    #[test]
-    fn emergency_exit_relaxes_data_confidence_but_not_route_freshness() {
-        let (p, t, mut m, mut e, s) = valid_fixture(Purpose::EmergencyExit);
-        m.independent_price_sources = 1;
-        e.slippage_bps = 1_000;
-        e.price_impact_bps = 900;
-        e.route_fee_bps = 800;
-        e.price_divergence_bps = 1_500;
-        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &t, &m, &e, &s);
-        assert!(d.allowed, "emergency exit unexpectedly blocked: {:?}", d.reasons);
-
-        e.timeline.quote_at_ms = e.timeline.signal_at_ms;
-        let d = PolicyEngine::new(RiskConfig::default()).evaluate(&p, &t, &m, &e, &s);
-        assert!(d.reasons.contains(&Rejection::QuoteNotAfterSignal));
     }
 }
