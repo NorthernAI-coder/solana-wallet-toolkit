@@ -85,7 +85,11 @@ fn fixture(purpose: Purpose) -> Fixture {
         risk_reference_nav_cents: 100_000,
         available_cash_cents: 70_000,
         total_exposure_cents: 30_000,
-        daily_realized_loss_cents: if purpose == Purpose::Entry { 4_999 } else { 100_000 },
+        daily_realized_loss_cents: if purpose == Purpose::Entry {
+            4_999
+        } else {
+            100_000
+        },
         open_positions,
         current_position_mint: position_mint,
         current_position_value_cents: position_value,
@@ -248,9 +252,8 @@ fn explicit_solana_authority_and_extension_hazards_are_denied() {
     cases.push((t, Rejection::TokenTransferFeeTooHigh));
 
     for (token, expected) in cases {
-        let r = PolicyEngine::new(RiskConfig::default()).evaluate(
-            &base.0, &base.1, &token, &base.3, &base.4, &base.5,
-        );
+        let r = PolicyEngine::new(RiskConfig::default())
+            .evaluate(&base.0, &base.1, &token, &base.3, &base.4, &base.5);
         assert!(r.reasons.contains(&expected), "missing {expected:?}");
     }
 }
@@ -301,9 +304,7 @@ fn exact_thresholds_and_market_quality_gates_hold() {
     let mut f = fixture(Purpose::Entry);
     f.3.market_cap_cents = 30_000_001;
     f.3.volume_24h_cents = 6_000_001;
-    assert!(evaluate(&f)
-        .reasons
-        .contains(&Rejection::MarketCapTooHigh));
+    assert!(evaluate(&f).reasons.contains(&Rejection::MarketCapTooHigh));
 
     let mut f = fixture(Purpose::Entry);
     f.3.market_cap_cents = 10_000_000;
@@ -340,9 +341,7 @@ fn post_decision_quote_and_evidence_freshness_are_strict() {
 fn zero_market_cap_is_invalid_not_a_divide_by_zero() {
     let mut f = fixture(Purpose::Entry);
     f.3.market_cap_cents = 0;
-    assert!(evaluate(&f)
-        .reasons
-        .contains(&Rejection::MarketCapInvalid));
+    assert!(evaluate(&f).reasons.contains(&Rejection::MarketCapInvalid));
 }
 
 #[test]
@@ -394,7 +393,11 @@ fn entry_only_gates_never_trap_normal_exit() {
     f.3.geckoterminal_score = 0;
     f.4.reverse_sell_simulation_passed = false;
     let r = evaluate(&f);
-    assert!(r.allowed, "exit trapped by entry-only gates: {:?}", r.reasons);
+    assert!(
+        r.allowed,
+        "exit trapped by entry-only gates: {:?}",
+        r.reasons
+    );
 }
 
 #[test]
@@ -428,9 +431,7 @@ fn global_kill_switch_blocks_every_purpose() {
             set_notional(&mut f.0, &mut f.4, 5_000);
         }
         f.5.global_kill_switch_active = true;
-        assert!(evaluate(&f)
-            .reasons
-            .contains(&Rejection::GlobalKillSwitch));
+        assert!(evaluate(&f).reasons.contains(&Rejection::GlobalKillSwitch));
     }
 }
 
