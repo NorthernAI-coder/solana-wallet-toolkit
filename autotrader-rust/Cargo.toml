@@ -1,0 +1,24 @@
+[package]
+name = "autotrader-fortress"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic risk firewall and adversarial simulator for an autonomous Solana trading agent"
+license = "MIT"
+publish = false
+
+[features]
+default = []
+live-trading = []
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[[bin]]
+name = "fortress-sim"
+path = "src/bin/fortress_sim.rs"
