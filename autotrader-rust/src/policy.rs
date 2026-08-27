@@ -396,7 +396,9 @@ impl PolicyEngine {
         let decision_at = execution.timeline.decision_recorded_at_ms;
         if token.checked_at_ms > decision_at {
             reasons.push(Rejection::TokenEvidenceFromFuture);
-        } else if decision_at.saturating_sub(token.checked_at_ms) > self.config.max_token_evidence_age_ms {
+        } else if decision_at.saturating_sub(token.checked_at_ms)
+            > self.config.max_token_evidence_age_ms
+        {
             reasons.push(Rejection::TokenEvidenceStale);
         }
 
@@ -456,9 +458,14 @@ impl PolicyEngine {
             reasons.push(Rejection::InsufficientCash);
         }
 
-        let max_total_exposure =
-            pct_of(portfolio.nav_cents, self.config.max_total_exposure_bps_of_nav);
-        match portfolio.total_exposure_cents.checked_add(proposal.notional_cents) {
+        let max_total_exposure = pct_of(
+            portfolio.nav_cents,
+            self.config.max_total_exposure_bps_of_nav,
+        );
+        match portfolio
+            .total_exposure_cents
+            .checked_add(proposal.notional_cents)
+        {
             Some(projected) if projected > max_total_exposure => {
                 reasons.push(Rejection::TotalExposureTooHigh)
             }
@@ -522,7 +529,9 @@ fn ratio_bps(numerator: u64, denominator: u64) -> u32 {
 mod tests {
     use super::*;
 
-    fn fixture(purpose: Purpose) -> (
+    fn fixture(
+        purpose: Purpose,
+    ) -> (
         ModelProposal,
         EvidenceBinding,
         TokenEvidence,
